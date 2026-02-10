@@ -1018,3 +1018,471 @@ This audit was conducted through static code analysis of the RustDesk source cod
 - Flutter/Dart UI code was not reviewed in depth (focus was on the Rust backend).
 - This is a static analysis only; no dynamic testing or fuzzing was performed.
 - The `AddrMangle` encoding/decoding in `hbb_common` was not auditable (submodule not available), but if address encoding is predictable, additional attacks on connection routing may be possible.
+
+---
+
+# Part III: Zero-Access Remote Attack Chains
+
+## The Premise
+
+Parts I and II assumed some form of local access (unprivileged shell) to exploit the IPC socket. This section answers: **what can an attacker do with absolutely zero prior access** — no local shell, no physical access, no credentials, no network adjacency?
+
+## External Attack Surface Inventory
+
+RustDesk exposes the following services to the network:
+
+| # | Service | Protocol | Bind Address | Default Port | Auth Required |
+|---|---------|----------|-------------|-------------|---------------|
+| 1 | **Direct Server** | TCP | `0.0.0.0` | `RENDEZVOUS_PORT + 2` (21118) | LoginRequest (password) |
+| 2 | **LAN Discovery** | UDP | `0.0.0.0` | `RENDEZVOUS_PORT + 3` (21119) | **None** |
+| 3 | **Port Forward Listener** | TCP | `0.0.0.0` | User-configured | Per-session auth |
+| 4 | **Rendezvous UDP** | UDP | Ephemeral | Outbound to RS | RS-level |
+| 5 | **Rendezvous TCP** | TCP | Ephemeral | Outbound to RS | RS-level |
+
+---
+
+## FINDING 15 (HIGH): Direct Server Port Has No Encryption — All Traffic in Plaintext
+
+**File:** `src/rendezvous_mediator.rs:810-817`
+**Impact:** Any remote connection to the direct-access port operates without encryption
+**Type:** CWE-319 (Cleartext Transmission of Sensitive Information)
+
+### Description
+
+The direct server spawns connections with `secure: false`:
+
+```rust
+// src/rendezvous_mediator.rs:810-817
+crate::server::create_tcp_connection(
+    server,
+    hbb_common::Stream::from(stream, local_addr),
+    addr,
+    false,      // ← secure = false — NEVER encrypted
+    None,
+)
+```
+
+In `create_tcp_connection()` (`src/server.rs:195`), the encryption setup is gated on `secure`:
+
+```rust
+if secure && pk.len() == sign::PUBLICKEYBYTES ... {
+    // key exchange happens here
+}
+// If !secure: Connection::start() runs with NO encryption
+```
+
+### Consequences
+
+Any connection to port 21118 (default) transmits in cleartext:
+- The password challenge/response (SHA256-hashed, but captured hash enables offline brute force)
+- ALL screen frames (video codec data)
+- ALL keyboard input (including passwords typed in the remote session)
+- ALL file transfers
+- ALL clipboard content
+
+An eavesdropper on ANY network hop between the attacker and target sees everything.
+
+---
+
+## FINDING 16 (HIGH): Pre-Authentication SSRF via Port Forward — Internal Network Port Scanner
+
+**File:** `src/server/connection.rs:2175-2207`
+**Impact:** Unauthenticated remote attacker can scan internal network ports through the RustDesk host
+**Type:** CWE-918 (Server-Side Request Forgery) + CWE-209 (Error Message Information Leak)
+
+### Description
+
+When a `LoginRequest` with a `PortForward` union arrives, the server processes it in this order:
+
+```
+Step 1: handle_login_request_without_validation()     [line 2101] — NO password check
+Step 2: Permission check (tunnel enabled?)             [line 2176] — passes if default config
+Step 3: TcpStream::connect(attacker-controlled-addr)   [line 2192] — BEFORE password check
+Step 4: Password validation                            [line 2293] — happens AFTER the connect
+```
+
+The critical code:
+
+```rust
+// src/server/connection.rs:2190-2207
+let mut addr = format!("{}:{}", pf.host, pf.port);
+self.port_forward_address = addr.clone();
+match timeout(3000, TcpStream::connect(&addr)).await {
+    Ok(Ok(sock)) => {
+        self.port_forward_socket = Some(Framed::new(sock, BytesCodec::new()));
+    }
+    _ => {
+        self.send_login_error(format!(
+            "Failed to access remote {}, please make sure if it is open",
+            addr                            // ← LEAKS the address back
+        )).await;
+        return false;                       // ← Returns BEFORE password check
+    }
+}
+// ... password check happens much later at line 2293 ...
+```
+
+### The Oracle
+
+The server returns **different error messages** depending on whether the internal port is open or closed:
+
+| Internal Port State | Server Response | Password Checked? |
+|---|---|---|
+| **Closed/Filtered** | `"Failed to access remote {host}:{port}"` | **No** — returns before password check |
+| **Open** | `"Password wrong"` (or other auth error) | **Yes** — password check happens |
+
+### Attack Execution
+
+```
+Attacker (Internet)                    RustDesk Host (port 21118)          Internal Network
+      │                                        │                                │
+      │──[TCP Connect]────────────────────────>│                                │
+      │<─[Hash{salt, challenge}]──────────────│                                │
+      │                                        │                                │
+      │──[LoginRequest{                        │                                │
+      │    PortForward{                        │                                │
+      │      host: "10.0.0.5",                 │                                │
+      │      port: 5432                        │──[TCP Connect]────────────────>│
+      │    },                                  │     (PostgreSQL)               │
+      │    password: "anything"                │<─[RST or SYN-ACK]────────────│
+      │  }]──────────────────────────────────>│                                │
+      │                                        │                                │
+      │<─[Error: "Failed to access..." OR      │                                │
+      │   Error: "Password wrong"]────────────│                                │
+      │                                        │                                │
+      │  (Different errors = port scan oracle) │                                │
+```
+
+### What Can Be Scanned
+
+- `localhost` services (databases, web servers, admin panels)
+- Cloud metadata endpoints (`169.254.169.254:80` for AWS/GCP/Azure)
+- Internal RFC1918 networks (`10.x.x.x`, `172.16.x.x`, `192.168.x.x`)
+- Adjacent infrastructure (monitoring, CI/CD, credentials vaults)
+- The 3-second timeout also provides timing information (open vs filtered)
+
+### No Authentication Required
+
+- The `host` and `port` are entirely attacker-controlled
+- The permission check at line 2176 passes with default configuration (`access-mode: "full"`)
+- The `control_permissions` is `None` for direct connections (line 816 of rendezvous_mediator.rs)
+- The only rate limit is the login failure counter, which isn't incremented for port-scan failures (the function returns before password validation)
+
+---
+
+## FINDING 17 (MEDIUM): LAN Discovery Leaks Device Identity Without Authentication
+
+**File:** `src/lan.rs:44-65`
+**Impact:** Any device on the LAN can enumerate all RustDesk instances and their identities
+**Type:** CWE-200 (Information Exposure)
+
+### Description
+
+The LAN discovery listener responds to UDP "ping" broadcasts with full device information:
+
+```rust
+// src/lan.rs:55-63
+let peer = PeerDiscovery {
+    cmd: "pong".to_owned(),
+    mac: get_mac(&self_addr),        // MAC address
+    id,                               // RustDesk device ID
+    hostname,                         // System hostname
+    username: crate::platform::get_active_username(),  // Logged-in username
+    platform: whoami::platform().to_string(),          // OS (Linux/Windows/macOS)
+    ..Default::default()
+};
+```
+
+**No authentication whatsoever.** Any device that sends a UDP packet to port 21119 receives:
+
+| Field | Value | Attacker Use |
+|---|---|---|
+| `id` | Device ID (e.g., "123 456 789") | Connect to this device via RS or direct port |
+| `hostname` | System hostname | Identify high-value targets (e.g., "dc01", "db-prod") |
+| `username` | Active user | Social engineering, identify admin accounts |
+| `platform` | OS type | Select platform-specific exploits |
+| `mac` | MAC address | Network fingerprinting, ARP spoofing target |
+
+### Attack Use
+
+1. Send UDP broadcast to port 21119 on the LAN
+2. Collect all RustDesk device IDs, hostnames, usernames
+3. Use the device IDs to connect via the direct server port (21118)
+4. Use the hostname/username information for targeted social engineering
+5. Use MAC addresses for ARP spoofing to position as MITM
+
+---
+
+## FINDING 18 (HIGH): Distributed Password Brute-Force with In-Memory Rate Limits
+
+**File:** `src/server/connection.rs:3412-3461`
+**Impact:** Rate limits are per-IP, in-memory, and reset on service restart — distributed attacks feasible
+**Type:** CWE-307 (Improper Restriction of Excessive Authentication Attempts)
+
+### Rate Limiting Analysis
+
+```rust
+// src/server/connection.rs:3436-3459
+let res = if failure.2 > 30 {                          // 30 total attempts lifetime
+    "Too many wrong attempts"
+} else if time == failure.0 && failure.1 > 6 {         // 6 attempts per minute
+    "Please try 1 minute later"
+} else {
+    true  // Allow attempt
+};
+```
+
+### Weaknesses
+
+| Property | Value | Weakness |
+|---|---|---|
+| Per-minute limit | 6 attempts/IP | Distributed across N IPs = 6N/minute |
+| Lifetime limit | 30 attempts/IP | Trivially bypassed with new IPs |
+| Storage | `lazy_static` HashMap (in-memory) | **Resets on service restart** |
+| IPv6 handling | /64=60, /56=80, /48=100 limits | Still high thresholds per prefix |
+| Password space | User-chosen passwords | Often weak (6-8 character, predictable) |
+
+### Attack Math
+
+With the direct server port (21118), connection is unencrypted:
+
+```
+Botnet of 1,000 IPs:
+- 6,000 password attempts per minute
+- 360,000 per hour
+- 8,640,000 per day
+
+Common password lists:
+- rockyou.txt top 10,000: cracked in ~2 minutes
+- rockyou.txt full (14M): cracked in ~2 days
+
+Service restart (crash/OOM/deliberate):
+- All rate limit counters reset to zero
+- Attacker can trigger restart via connection flooding → OOM
+```
+
+### The Unencrypted Channel Advantage
+
+Because the direct server port uses **no encryption** (Finding 15), an eavesdropper who captures even ONE successful authentication can:
+1. Capture `Hash{salt, challenge}` and the login response
+2. Capture `SHA256(SHA256(password + salt) + challenge)` from the LoginRequest
+3. Perform offline dictionary attack against the captured hash
+4. No more brute-force needed — single capture is sufficient
+
+---
+
+## COMPLETE ZERO-ACCESS ATTACK CHAIN F: Internet → Port Scan → Password Crack → Full Compromise
+
+**Entry Point:** Internet access only — zero credentials, zero local access
+**End Result:** Full remote desktop control, terminal access, file exfiltration, internal network pivoting
+
+```
+Phase 1: Reconnaissance (automated, <1 minute per target)
+├─ Masscan/zmap for port 21118 across target IP range
+├─ For each responding host: confirmed RustDesk instance
+├─ If on same LAN: UDP broadcast to port 21119
+│   → Receive: device ID, hostname, username, platform, MAC
+└─ Identify high-value targets by hostname/username
+
+Phase 2: Internal Network Mapping via Pre-Auth SSRF (no credentials needed)
+├─ Connect to port 21118
+├─ Receive Hash{salt, challenge}
+├─ Send LoginRequest with PortForward{host: "169.254.169.254", port: 80}
+│   → "Failed to access remote..." = cloud metadata blocked
+│   → "Password wrong" = cloud metadata endpoint REACHABLE
+├─ Scan common internal ranges:
+│   ├─ 10.0.0.1-254:22     (SSH)
+│   ├─ 10.0.0.1-254:3389   (RDP)
+│   ├─ 10.0.0.1-254:5432   (PostgreSQL)
+│   ├─ 10.0.0.1-254:6379   (Redis)
+│   ├─ 10.0.0.1-254:8080   (Web admin)
+│   ├─ 10.0.0.1-254:9200   (Elasticsearch)
+│   └─ 127.0.0.1:*          (localhost services)
+├─ Rate limit does NOT apply (failures return before password check)
+└─ Result: complete map of internal network services
+
+Phase 3: Password Brute-Force (distributed, hours to days)
+├─ Direct server connection = UNENCRYPTED (secure: false)
+├─ Distribute across botnet IPs (6 attempts/minute/IP)
+├─ Or: capture ONE legitimate login from network (passive sniffing)
+│   → Offline dictionary attack against SHA256 hash
+├─ Common passwords cracked quickly:
+│   Top 10K passwords: ~2 minutes with 1K IPs
+│   Full rockyou: ~2 days with 1K IPs
+└─ Password found → proceed to Phase 4
+
+Phase 4: Full Compromise (immediate)
+├─ Connect to port 21118 with cracked password
+├─ Full remote desktop: see screen, control keyboard/mouse
+├─ If terminal enabled: full shell access
+├─ If file transfer enabled: exfiltrate any data
+├─ If tunnel enabled: port forward to internal services found in Phase 2
+│   ├─ Connect to internal databases directly
+│   ├─ Connect to cloud metadata → steal cloud credentials
+│   ├─ Connect to internal web admin panels
+│   └─ Pivot to additional machines
+└─ All traffic UNENCRYPTED on the wire (direct port, secure=false)
+
+Phase 5: Persistence (post-compromise)
+├─ Via terminal: install backdoor, create accounts
+├─ Via IPC socket (now accessible locally):
+│   ├─ Read/set permanent password
+│   ├─ Disable 2FA
+│   ├─ Redirect to attacker's RS
+│   └─ Full config control (see Part II chains)
+└─ Persistent access established
+```
+
+---
+
+## COMPLETE ZERO-ACCESS ATTACK CHAIN G: Compromised Public Rendezvous Server → Mass Surveillance
+
+**Entry Point:** Compromise of a public RustDesk rendezvous server
+**End Result:** MITM capability over ALL devices registered to that server
+**Affected:** Every RustDesk user using the compromised RS
+
+### Background
+
+RustDesk's trust model places the rendezvous server as the **sole root of trust** for peer identity:
+- The RS signs `{peer_ID, peer_PublicKey}` tuples (`src/client.rs:770`)
+- Clients verify these signatures against the RS's public key
+- There is NO independent verification of peer identity (no certificate pinning, no TOFU, no out-of-band check)
+
+### Attack Steps
+
+```
+Phase 1: RS Compromise
+├─ Compromise a public RS (rs-ny.rustdesk.com, etc.)
+│   via: software vulnerability, credential theft, insider, supply chain
+├─ Obtain the RS's signing private key
+└─ All registered devices trust this key for peer identity
+
+Phase 2: Selective MITM
+├─ When Client A requests connection to Device B:
+│   ├─ RS normally provides: RS_sign(B_ID + B_PublicKey)
+│   ├─ Attacker substitutes: RS_sign(B_ID + Attacker_PublicKey)
+│   ├─ Client A verifies signature → PASSES (RS key is legitimate)
+│   └─ Client A establishes encrypted channel with Attacker, not Device B
+├─ Attacker separately connects to Device B as a normal client
+├─ Attacker relays traffic between A and B (transparent MITM)
+└─ Neither party detects the interception
+
+Phase 3: Capabilities
+├─ Read all screen content in real-time
+├─ Read all keyboard input (including credentials)
+├─ Read all file transfers
+├─ Read all clipboard operations
+├─ Inject keyboard/mouse input into either direction
+├─ Modify file transfers in transit
+├─ Selectively drop or delay messages
+└─ Record sessions for later analysis
+
+Phase 4: Scale
+├─ This affects ALL connections routed through the compromised RS
+├─ Could be tens of thousands of devices
+├─ Attack is selective (can target specific device IDs)
+├─ No client-side indicator of compromise
+└─ Persists until RS is re-secured and all clients get new RS keys
+```
+
+### Why There Is No Defense
+
+The protocol has no mechanism for:
+- Peer certificate pinning (remembering a peer's key from previous connections)
+- Trust-on-first-use (TOFU) for peer identity
+- Out-of-band peer key verification
+- Client notification when a peer's key changes
+- Multiple signature verification (requiring >1 RS to agree)
+
+---
+
+## COMPLETE ZERO-ACCESS ATTACK CHAIN H: DNS Poisoning → Session Hijack
+
+**Entry Point:** DNS poisoning capability (local network, ISP, or registrar level)
+**End Result:** Redirect all connections through attacker-controlled infrastructure
+
+```
+Phase 1: DNS Poisoning
+├─ Target: the domain name configured as custom-rendezvous-server
+│   (or the default rs-ny.rustdesk.com / rs-sg.rustdesk.com)
+├─ Methods: DNS cache poisoning, rogue DHCP, compromised resolver,
+│   registrar account takeover, BGP hijack of DNS server
+└─ Result: domain resolves to attacker's IP
+
+Phase 2: Fake Rendezvous Server
+├─ Attacker runs a rendezvous server on their IP
+├─ Critical question: does the client verify the RS's key?
+│
+├─ Case A: Custom RS with key configured
+│   ├─ secure_tcp() verifies RS key via signature
+│   ├─ Attacker needs the RS's private key → attack BLOCKED
+│   └─ (unless combined with IPC access to change the key)
+│
+├─ Case B: Custom RS without key configured (key is empty)
+│   ├─ src/client.rs:424-428: secure_tcp only called if
+│   │   key AND token are both non-empty
+│   ├─ If key is empty: NO secure_tcp → plaintext RS connection
+│   ├─ Attacker's fake RS receives plaintext PunchHoleRequest
+│   ├─ Attacker routes connection through their relay
+│   └─ Combined with protocol downgrade: full MITM
+│
+└─ Case C: Default public RS
+    ├─ Uses hardcoded RS_PUB_KEY (config::RS_PUB_KEY)
+    ├─ Attacker needs the official RS private key → attack BLOCKED
+    └─ (unless public RS is compromised — see Chain G)
+
+Phase 3: Impact (for Case B — custom RS without key)
+├─ All devices using this RS are redirected to attacker
+├─ Attacker controls connection routing
+├─ Combined with protocol downgrade (Finding 13): all traffic plaintext
+└─ Full surveillance and injection capability
+```
+
+---
+
+## External Attack Surface Summary
+
+```
+                    INTERNET
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+        ▼              ▼              ▼
+   Port 21118     DNS/Network     Rendezvous
+  (Direct TCP)     Attacks       Server Trust
+        │              │              │
+        ├─ UNENCRYPTED │              │
+        │  (secure=    │              │
+        │   false)     │              │
+        │              │              │
+        ├─ Pre-auth    ├─ DNS poison  ├─ If RS
+        │  SSRF/port   │  → redirect  │  compromised:
+        │  scanner     │  RS traffic   │  MITM all
+        │  (Finding    │              │  connections
+        │   16)        ├─ Protocol    │
+        │              │  downgrade   ├─ Sign any
+        ├─ Password    │  (Finding    │  peer identity
+        │  brute-force │   13)        │
+        │  distributed │              ├─ Route to
+        │  (Finding    │              │  attacker
+        │   18)        │              │  relay
+        │              │              │
+        ├─ Traffic     │              │
+        │  eavesdrop   │              │
+        │  → offline   │              │
+        │  hash crack  │              │
+        │              │              │
+        ▼              ▼              ▼
+   FULL REMOTE     FULL MITM      MASS
+   DESKTOP         OF SESSION     SURVEILLANCE
+   CONTROL                        OF ALL USERS
+```
+
+### Key Insight: No Local Access Required
+
+The direct server port (21118) is the primary zero-access vector because:
+1. It binds to `0.0.0.0` — reachable from the internet
+2. It passes `secure: false` — zero encryption, ever
+3. It processes `PortForward` TCP connections before password validation — pre-auth SSRF
+4. Its rate limiting is per-IP and in-memory — trivially bypassed with distribution or restart
+5. The captured password hash can be cracked offline from a single eavesdropped session
