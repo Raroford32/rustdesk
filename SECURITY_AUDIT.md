@@ -1486,3 +1486,364 @@ The direct server port (21118) is the primary zero-access vector because:
 3. It processes `PortForward` TCP connections before password validation — pre-auth SSRF
 4. Its rate limiting is per-IP and in-memory — trivially bypassed with distribution or restart
 5. The captured password hash can be cracked offline from a single eavesdropped session
+
+---
+
+# Part IV: End-to-End Validated Attack — Zero to Root Shell (Every Code Path Traced)
+
+This section traces, step by step, every function call from an internet attacker with zero prior access through to a root shell on the target machine. Every claim is backed by an exact code location.
+
+## Prerequisites
+
+- Target: A machine running RustDesk service (as root/SYSTEM, typical for systemd/Windows service)
+- Attacker: Internet access to port 21118 on the target
+- Configuration: Default settings (direct server enabled, terminal enabled, access-mode "full")
+- No credentials, no local access, no network adjacency needed
+
+## Step 0: Port Scan — Discover Target
+
+The direct server binds to all interfaces:
+
+```
+src/rendezvous_mediator.rs:772
+  hbb_common::tcp::listen_any(port as _)    // 0.0.0.0:21118
+```
+
+Attacker runs: `nmap -p 21118 <target_range>` → identifies RustDesk instances.
+
+## Step 1: TCP Connect — Enter `create_tcp_connection`
+
+```
+src/rendezvous_mediator.rs:802
+  if let Ok(Ok((stream, addr))) = hbb_common::timeout(1000, l.accept()).await
+
+src/rendezvous_mediator.rs:810-817
+  crate::server::create_tcp_connection(
+      server,
+      hbb_common::Stream::from(stream, local_addr),
+      addr,
+      false,     // ← CRITICAL: secure = false
+      None,      // ← no control_permissions
+  )
+```
+
+**Validated:** `secure=false` → no encryption setup ever occurs. Proceeds to:
+
+```
+src/server.rs:195
+  if secure && pk.len() == sign::PUBLICKEYBYTES ...  // false && ... = never entered
+```
+
+Key exchange is ENTIRELY SKIPPED. The stream has no encryption key.
+
+## Step 2: `Connection::start` → `on_open` — Receive Challenge
+
+```
+src/server/connection.rs:363-367
+  let hash = Hash {
+      salt: Config::get_salt(),                  // from config file
+      challenge: Config::get_auto_password(6),   // random 6-char string
+      ..Default::default()
+  };
+
+src/server/connection.rs:484
+  if !conn.on_open(addr).await { ... }
+
+src/server/connection.rs:1229-1231  (inside on_open)
+  let mut msg_out = Message::new();
+  msg_out.set_hash(self.hash.clone());
+  self.send(msg_out).await;            // ← Sent to attacker in PLAINTEXT
+```
+
+**What the attacker receives (plaintext):**
+- `salt` — the password salt (stable across connections)
+- `challenge` — random 6-char nonce (changes per connection)
+
+## Step 3A: Pre-Auth SSRF — Internal Port Scanning (Optional)
+
+Before even attempting a password, the attacker can scan the internal network:
+
+```
+Attacker sends (plaintext): LoginRequest {
+    my_id: "anything",
+    password: [all zeros],   // wrong, doesn't matter
+    union: PortForward { host: "10.0.0.5", port: 5432 },
+}
+```
+
+Code execution path:
+
+```
+src/server/connection.rs:768-779      — stream.next() → parse protobuf → on_message()
+src/server/connection.rs:2100         — if LoginRequest
+src/server/connection.rs:2101         — handle_login_request_without_validation()  (NO password check)
+src/server/connection.rs:2175         — match PortForward
+src/server/connection.rs:2176-2179    — Self::permission(OPTION_ENABLE_TUNNEL, &self.control_permissions)
+                                         control_permissions = None → falls through to:
+src/server/connection.rs:2009         — Self::is_permission_enabled_locally("enable-tunnel")
+                                         access-mode == "full" → returns true
+src/server/connection.rs:2192         — TcpStream::connect("10.0.0.5:5432")  ← FIRES BEFORE PASSWORD CHECK
+```
+
+**Two outcomes:**
+- Port closed → `"Failed to access remote 10.0.0.5:5432"` (line 2200) → return false (line 2205)
+- Port open → socket stored (line 2194) → proceeds to password check (line 2293)
+
+**Attacker repeats with different host:port combinations.** No rate limiting applies because the function returns before password validation (line 2205), so `update_failure` is never called.
+
+## Step 3B: Password Brute-Force
+
+The attacker has `salt` from Step 2. For each password guess:
+
+```
+Client computes: SHA256(SHA256(guess + salt) + challenge)
+Sends: LoginRequest { password: <hash_bytes>, my_id: "attacker", ... }
+```
+
+Server validation:
+
+```
+src/server/connection.rs:2293        — let (failure, res) = self.check_failure(0).await;
+src/server/connection.rs:3436-3459   — Rate limit: 6/minute/IP, 30 total/IP
+src/server/connection.rs:2297        — self.validate_password()
+
+src/server/connection.rs:1907-1918   — validate_one_password:
+  hasher = SHA256(password + self.hash.salt)
+  hasher2 = SHA256(hasher_result + self.hash.challenge)
+  hasher2.finalize()[..] == self.lr.password[..]    // ← NON-constant-time comparison
+```
+
+**Distributed attack math (1,000 IPs):**
+- 6,000 attempts/minute → top 10K passwords in ~2 minutes
+- In-memory rate limits (`lazy_static HashMap`) → reset on service restart
+
+**Alternative: Passive eavesdropping.**
+Since the channel is unencrypted, capture one legitimate login → have `{salt, challenge, hash}` → offline dictionary attack with no rate limits.
+
+## Step 4: Password Accepted — `send_logon_response`
+
+Password matches:
+
+```
+src/server/connection.rs:2309        — self.update_failure(failure, true, 0);  // clear failure counter
+src/server/connection.rs:2314        — self.send_logon_response().await;
+
+src/server/connection.rs:1376        — self.authorized = true;       // ← THE GATE OPENS
+src/server/connection.rs:1377-1387   — conn_type determined by request type
+src/server/connection.rs:1405-1558   — LoginResponse with PeerInfo sent back:
+    - username (active user)
+    - hostname
+    - platform
+    - supported features (terminal, privacy mode, etc.)
+    - display information
+```
+
+**The attacker now has `self.authorized = true`.** All post-auth message handlers become available.
+
+## Step 5: Post-Auth Capabilities — What the Attacker Can Do
+
+With `authorized = true`, the message handler (`on_message`) processes all message types. Here is every capability and its code path:
+
+### 5A: Screen Capture (Remote Desktop)
+
+After auth, the server subscribes the connection to video services:
+
+```
+src/server/connection.rs:1637-1654   — sub_service → server.add_connection()
+src/server.rs:380-396                — add_connection → subscribes to video_service, audio_service,
+                                        clipboard_service, input_service for all monitors
+```
+
+Video frames are sent via `tx_video` channel → attacker receives real-time screen content.
+**All in plaintext** (no encryption key was set).
+
+### 5B: Keyboard & Mouse Input
+
+```
+src/server/connection.rs:2382-2466   — on_message handles message::Union::KeyEvent
+src/server/connection.rs:2467-2522   — handles MouseEvent
+
+src/server/connection.rs:1010-1030   — handle_input thread:
+    MessageInput::Mouse(mouse_input) → handle_mouse()     // simulates mouse
+    MessageInput::Key((msg, press))  → handle_key()        // simulates keypress
+```
+
+**Attacker sends keystrokes → executed on target machine.** Can type commands in any open application.
+
+### 5C: Clipboard Access
+
+```
+src/server/connection.rs:2547-2600   — handles Cliprdr messages
+    → clipboard read/write between attacker and target
+```
+
+**Attacker reads clipboard content** (copied passwords, tokens, etc.) and can inject clipboard data.
+
+### 5D: File Transfer
+
+```
+src/server/connection.rs:2605-2800   — handles FileAction messages:
+    - ReadDir      → list any directory
+    - ReadDirAll   → recursive directory listing
+    - SendFile     → receive any file from target
+    - ReceiveFile  → write any file to target
+    - RemoveFile   → delete files
+    - RemoveDir    → delete directories
+    - CreateDir    → create directories
+```
+
+**Full filesystem access** — read any file, write any file, delete any file.
+Runs as the service user (root on Linux).
+
+### 5E: Terminal / Shell Access
+
+```
+src/server/connection.rs:2127-2174   — LoginRequest with Terminal union
+src/server/connection.rs:1659-1662   — self.init_terminal_service().await
+
+src/server/terminal_service.rs:841-882  — PTY creation:
+  pty_system.openpty(pty_size)
+  cmd = CommandBuilder::new(&shell)      // /bin/bash, /bin/zsh, or /bin/sh
+  pty_pair.slave.spawn_command(cmd)      // shell spawned as service user
+
+src/server/connection.rs:3207-3215 (Linux):
+  self.terminal_user_token = Some(TerminalUserToken::SelfUser);
+  // Parameters IGNORED — always runs as service user
+  // If service is root → shell is root
+```
+
+**Attacker sends TerminalAction::Data → raw bytes written to PTY → executed as shell commands.**
+No command filtering, no sandboxing, no audit (terminal_service.rs:1274-1305).
+
+On Linux with systemd service: **root shell**.
+On Windows as service: **SYSTEM shell**.
+
+### 5F: Port Forwarding (Network Pivoting)
+
+```
+src/server/connection.rs:2175-2207   — LoginRequest with PortForward
+src/server/connection.rs:2192        — TcpStream::connect(host:port) to ANY address
+src/server/connection.rs:1109-1163   — try_port_forward_loop:
+    forward.next() → self.stream.send_bytes()    // internal → attacker
+    self.stream.next() → forward.send()           // attacker → internal
+```
+
+**Raw TCP tunnel** to any internal host:port. Combined with root shell, enables:
+- Cloud metadata theft (`169.254.169.254`)
+- Database access (`10.x.x.x:5432/3306/6379`)
+- SSH pivoting (`10.x.x.x:22`)
+- Internal web service exploitation
+
+## Step 6: Persistence
+
+With root/SYSTEM shell access, the attacker can:
+
+1. **Create OS-level backdoor** — new user accounts, SSH keys, cron jobs
+2. **Modify RustDesk config** — set known password, disable 2FA, redirect RS (via IPC or direct config file edit)
+3. **Install additional tools** — C2 implants, keyloggers, miners
+4. **Pivot to other machines** — using port forwarding or SSH from the compromised host
+
+## Complete Code Path Diagram
+
+```
+INTERNET ATTACKER
+       │
+       │ TCP connect to 0.0.0.0:21118
+       ▼
+rendezvous_mediator.rs:802  l.accept()
+       │
+       │ secure = false, control_permissions = None
+       ▼
+server.rs:195  create_tcp_connection(secure=FALSE)
+       │
+       │ Encryption setup SKIPPED (if secure && ... never true)
+       ▼
+connection.rs:484  on_open(addr)
+       │
+       │ Hash{salt, challenge} sent in PLAINTEXT
+       ▼
+connection.rs:1229-1231  self.send(hash)  ──────────────> ATTACKER receives salt+challenge
+       │
+       │ Wait for message...
+       ▼
+connection.rs:768-779  stream.next() → on_message()
+       │
+       ├── PRE-AUTH: LoginRequest with PortForward
+       │   │
+       │   ▼ connection.rs:2192  TcpStream::connect(attacker_host:attacker_port)
+       │   │                     [BEFORE password check]
+       │   │
+       │   ├── Port closed: "Failed to access remote..."  → return false
+       │   └── Port open: store socket → continue to password check
+       │
+       ├── LoginRequest with password hash
+       │   │
+       │   ▼ connection.rs:2293  check_failure() [rate limit: 6/min/IP]
+       │   │
+       │   ▼ connection.rs:2297  validate_password()
+       │   │   └── connection.rs:1917  SHA256 compare (non-constant-time)
+       │   │
+       │   ├── FAIL: "Password wrong" → try again
+       │   │
+       │   └── SUCCESS:
+       │       │
+       │       ▼ connection.rs:1376  self.authorized = true
+       │       │
+       │       ▼ connection.rs:1405  LoginResponse with PeerInfo
+       │                             (hostname, username, platform, features)
+       │
+       ▼ POST-AUTH (authorized = true)
+       │
+       ├── Screen Capture
+       │   server.rs:380  add_connection() → video frames stream
+       │
+       ├── Keyboard/Mouse
+       │   connection.rs:1010-1030  handle_key/handle_mouse → enigo input simulation
+       │
+       ├── File Transfer
+       │   connection.rs:2605-2800  ReadDir/SendFile/ReceiveFile/RemoveFile
+       │   (runs as root/SYSTEM)
+       │
+       ├── Clipboard
+       │   connection.rs:2547-2600  read/write clipboard content
+       │
+       ├── Terminal (ROOT SHELL)
+       │   terminal_service.rs:879  spawn_command("/bin/bash")
+       │   terminal_service.rs:1294  raw data → PTY (no filtering)
+       │   Linux: runs as service user = root
+       │   Windows: runs as SYSTEM
+       │
+       └── Port Forward (NETWORK PIVOT)
+           connection.rs:1132-1146  bidirectional TCP proxy
+           to ANY internal host:port
+           ├── 169.254.169.254:80   → cloud credentials
+           ├── 10.0.0.x:5432       → PostgreSQL
+           ├── 10.0.0.x:22         → SSH
+           └── 127.0.0.1:*         → localhost services
+```
+
+## Severity Assessment
+
+| Step | Severity | Issue |
+|---|---|---|
+| Port 21118 open to internet | CRITICAL | `listen_any(port)` binds to 0.0.0.0 by default |
+| No encryption on direct port | CRITICAL | `secure=false` hardcoded at call site |
+| Pre-auth SSRF | HIGH | `TcpStream::connect` before password validation |
+| Weak rate limiting | HIGH | Per-IP, in-memory, 6/min with 30 total |
+| Non-constant-time password compare | MEDIUM | `==` operator on hash slices |
+| Root/SYSTEM terminal | CRITICAL | No privilege drop, no command filtering |
+| Unrestricted port forwarding | HIGH | Any host:port after auth |
+| No encryption on session data | CRITICAL | Screen, keyboard, files all in plaintext |
+
+## What Makes This a Complete Kill Chain
+
+This is not a theoretical attack. Every step has been traced through actual code paths:
+
+1. **Discovery**: The port is open by default, bound to all interfaces
+2. **Reconnaissance**: Pre-auth SSRF maps the internal network with zero credentials
+3. **Access**: Password brute-force or passive eavesdropping (unencrypted channel)
+4. **Exploitation**: Root shell, full file system, screen capture, keyboard injection
+5. **Pivoting**: Port forwarding to any internal host
+6. **Persistence**: Root access allows arbitrary backdoor installation
+
+The only defense between an internet attacker and a root shell is the **user's password** — transmitted and compared over an **unencrypted channel** with **bypassable rate limiting**.
