@@ -1837,13 +1837,143 @@ connection.rs:768-779  stream.next() → on_message()
 
 ## What Makes This a Complete Kill Chain
 
-This is not a theoretical attack. Every step has been traced through actual code paths:
+Every step has been traced through actual code paths. However, an honest assessment of what an attacker can actually achieve requires distinguishing what is **realistic** from what is **theoretical**.
 
-1. **Discovery**: The port is open by default, bound to all interfaces
-2. **Reconnaissance**: Pre-auth SSRF maps the internal network with zero credentials
-3. **Access**: Password brute-force or passive eavesdropping (unencrypted channel)
-4. **Exploitation**: Root shell, full file system, screen capture, keyboard injection
-5. **Pivoting**: Port forwarding to any internal host
-6. **Persistence**: Root access allows arbitrary backdoor installation
+---
 
-The only defense between an internet attacker and a root shell is the **user's password** — transmitted and compared over an **unencrypted channel** with **bypassable rate limiting**.
+# Part V: Honest Practical Assessment — What Actually Works
+
+## Critical Correction: Direct Server Is OFF by Default
+
+The `option2bool` function (`flutter/lib/common.dart:1572-1580`) treats `"direct-server"` as opt-in:
+
+```dart
+} else if (option == kOptionDirectServer || ...) {
+    res = value == "Y";    // Must be EXPLICIT "Y" to enable
+}
+```
+
+**Port 21118 does not listen unless the user manually enables "Enable direct IP access."**
+
+Furthermore, the normal connection flow (via rendezvous server) passes `secure: true`:
+
+| Connection Path | `secure` | Encryption | Code |
+|---|---|---|---|
+| Direct server (port 21118) | `false` | **NEVER** | `rendezvous_mediator.rs:815` |
+| Hole-punch via RS | `true` | **YES** | `rendezvous_mediator.rs:560,643` |
+| Relay via RS | variable | Usually yes | `rendezvous_mediator.rs:476` |
+
+The normal connection path IS encrypted. This means the Part IV kill chain (internet → root shell) requires a **non-default configuration**.
+
+## Realistic Threat Matrix by Access Level
+
+### Tier 1: Pure Internet Attacker — No Access at All
+
+**Scenario A: Target has default configuration (direct server OFF)**
+
+| Attack | Works? | Why |
+|---|---|---|
+| Port scan for 21118 | **NO** | Port not listening (disabled by default) |
+| Pre-auth SSRF | **NO** | No direct port to connect to |
+| Password brute-force over direct port | **NO** | No direct port to connect to |
+| Eavesdrop on password hash | **NO** | Normal RS path uses encryption |
+| Connect via RS + brute-force password | **YES, but slow** | Must go through RS, connection is encrypted, but password guessing still possible at 6/min/IP |
+| Protocol downgrade on RS connection | **NO** | Requires MITM position on network path |
+| Compromised public RS → MITM | **YES** | If attacker compromises the RS infrastructure itself (Finding 13, Chain G) |
+
+**Realistic outcome with default config:** An internet attacker can only brute-force the password through the rendezvous server at 6 attempts/minute/IP. With a strong password (12+ chars), this is **infeasible**. With a weak password (common dictionary word), it could succeed in days with distributed IPs.
+
+**Scenario B: Target has direct server enabled + port reachable (non-default)**
+
+| Attack | Works? | Why |
+|---|---|---|
+| Port scan for 21118 | **YES** | Port listening on 0.0.0.0 |
+| Pre-auth SSRF/port scan | **YES** | Finding 16 — TcpStream::connect before auth |
+| Password brute-force | **YES** | Unencrypted channel, 6/min/IP |
+| Passive eavesdrop → offline crack | **YES** | No encryption on direct port |
+| Root shell after password crack | **YES** | Full Part IV chain |
+
+**Realistic outcome:** Full kill chain works, but requires BOTH direct server enabled AND port reachable from internet (not behind NAT). This is a **real configuration** in:
+- Cloud VMs with public IPs (no firewall rules on 21118)
+- Corporate networks where direct access is enabled for IT convenience
+- IoT/kiosk deployments with static public IPs
+- Self-hosted servers exposed to the internet
+
+### Tier 2: LAN Attacker — Same Network, No Credentials
+
+| Attack | Works? | Requires |
+|---|---|---|
+| LAN discovery → enumerate devices | **YES** | Nothing — default ON, no auth (Finding 17) |
+| Receive device ID, hostname, username, MAC | **YES** | Single UDP packet to port 21119 |
+| ARP spoof → MITM RS connection | **YES** | ARP spoofing capability |
+| Strip PK from PunchHoleResponse → downgrade | **YES** | MITM position (via ARP spoof) |
+| Unencrypted session → eavesdrop passwords | **YES** | Combined with protocol downgrade |
+| Direct port (if enabled) → unencrypted brute-force | **YES** | Direct server enabled |
+
+**Realistic outcome:** A LAN attacker can enumerate targets via LAN discovery (always works), and if they can ARP spoof, they can downgrade the encryption on any rendezvous-mediated connection. This is the most practical remote attack scenario.
+
+### Tier 3: Local Unprivileged User — Shell Access on Target Machine
+
+| Attack | Works? | Requires |
+|---|---|---|
+| Read permanent password via IPC | **YES** | Any local user (IPC is 0o0777) |
+| Read 2FA secret via IPC + decrypt with "00" | **YES** | Any local user |
+| Replace entire config via SyncConfig | **YES** | Any local user |
+| Redirect to rogue RS → MITM all connections | **YES** | Any local user |
+| Remote access from anywhere with stolen creds | **YES** | Any local user |
+| Persistent backdoor surviving password changes | **YES** | Any local user |
+
+**Realistic outcome:** This is the most dangerous tier. **Any unprivileged local user on the machine has complete control.** No brute-force needed, no network position needed, no configuration requirements. The IPC socket permissions (0o0777) make this unconditional. This is the chain that works 100% of the time on any RustDesk installation.
+
+## The Complete Picture
+
+```
+ACCESS LEVEL          WHAT ACTUALLY WORKS                    REAL-WORLD LIKELIHOOD
+─────────────────────────────────────────────────────────────────────────────────
+
+Internet only         Password brute-force via RS            LOW (encrypted, rate-limited,
+(default config)      (only path available)                  strong passwords survive)
+
+Internet only         Full Part IV kill chain:               MEDIUM in specific environments
+(direct server ON     unencrypted, SSRF, brute-force,       (cloud VMs, corporate IT,
++ port reachable)     root shell                            kiosks, self-hosted)
+
+Same LAN              LAN discovery + ARP spoof +            HIGH (LAN access is common,
+                      protocol downgrade → plaintext         ARP spoofing is trivial,
+                      session interception                   discovery always works)
+
+Local unprivileged    IPC → read all creds → remote          CERTAIN (works on 100% of
+user                  access from anywhere → root shell      installations, no conditions)
+```
+
+## What the Original Claim Should Have Said
+
+**Original (incorrect):**
+> "The only thing between an internet attacker and a root shell on port 21118 is the user's password — transmitted over an unencrypted channel with bypassable rate limiting."
+
+**Corrected:**
+> Port 21118 is off by default. When the user enables it AND the port is internet-reachable, the connection is unencrypted with bypassable rate limiting. With default configuration, remote attacks must go through the rendezvous server where encryption is active — the password is the barrier, but it's properly protected in transit. The unconditional vulnerability is at the local level: any unprivileged user on the machine can read all credentials via the world-accessible IPC socket and gain full remote access from anywhere without any brute-force.
+
+## Findings Severity Re-Assessment
+
+| Finding | Original Severity | Revised Severity | Rationale |
+|---|---|---|---|
+| IPC socket 0o0777 (F1) | CRITICAL | **CRITICAL** — unchanged | Works on 100% of installations, no prerequisites |
+| 2FA hardcoded key (F3) | HIGH-CRITICAL | **HIGH-CRITICAL** — unchanged | Unconditional via IPC |
+| Protocol downgrade (F13) | CRITICAL | **HIGH** | Requires MITM position (ARP spoof or network control) |
+| SyncConfig full replace (F14) | CRITICAL | **CRITICAL** — unchanged | Unconditional via IPC |
+| Direct port unencrypted (F15) | CRITICAL | **HIGH** | Direct server is off by default |
+| Pre-auth SSRF (F16) | HIGH | **HIGH (conditional)** | Only when direct server is enabled |
+| LAN discovery info leak (F17) | MEDIUM | **MEDIUM** — unchanged | LAN-only, but always on by default |
+| Distributed brute-force (F18) | HIGH | **MEDIUM-HIGH** | Direct port is off by default; RS path is encrypted |
+
+## The Three Real Threats (in order of practical danger)
+
+**1. Any local user → full remote compromise (CERTAIN)**
+IPC socket permissions are hardcoded. Cannot be mitigated without code changes. Works on every installation.
+
+**2. LAN attacker → protocol downgrade → session interception (HIGH)**
+LAN discovery is on by default, ARP spoofing is trivial. Requires same-network position but no credentials.
+
+**3. Direct-port internet attack → root shell (CONDITIONAL)**
+Requires non-default configuration (direct server enabled) AND network reachability. When conditions are met, the kill chain is devastating. But conditions are not met by default.
