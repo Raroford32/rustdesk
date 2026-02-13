@@ -1977,3 +1977,245 @@ LAN discovery is on by default, ARP spoofing is trivial. Requires same-network p
 
 **3. Direct-port internet attack → root shell (CONDITIONAL)**
 Requires non-default configuration (direct server enabled) AND network reachability. When conditions are met, the kill chain is devastating. But conditions are not met by default.
+
+---
+
+# Part VI: Random ID Scanning via Rendezvous Server — Pure Remote Attack (Default Config)
+
+## The Question
+
+Can an attacker with zero prior access randomly scan RustDesk device IDs through the public rendezvous server, find online devices, and gain access — all against DEFAULT configuration?
+
+## FINDING 19 (HIGH): Device ID Enumeration Oracle via Rendezvous Server
+
+**File:** `src/client.rs:483-502`
+**Impact:** Attacker can enumerate all valid RustDesk device IDs through the public RS
+**Type:** CWE-204 (Observable Response Discrepancy)
+
+### Device ID Format
+
+RustDesk device IDs are **9-digit numeric** values (e.g., "123 456 789"):
+
+```dart
+// flutter/lib/common/formatter/id_formatter.dart:43
+if (int.tryParse(id2) == null) return id;  // Numeric only
+```
+
+**Total keyspace: 10^9 = 1,000,000,000 (1 billion)**
+
+IDs are derived from a UUID/machine-UID hash, not sequential — but the keyspace is only 9 digits.
+
+### The Enumeration Oracle
+
+When a client sends a `PunchHoleRequest` to the rendezvous server, the RS returns distinct error codes:
+
+```rust
+// src/client.rs:488-501
+match ph.failure.enum_value() {
+    Ok(punch_hole_response::Failure::ID_NOT_EXIST) => {
+        bail!("ID does not exist");           // ID never registered
+    }
+    Ok(punch_hole_response::Failure::OFFLINE) => {
+        bail!("Remote desktop is offline");   // ID exists, device not connected
+    }
+    // ... LICENSE_MISMATCH, LICENSE_OVERUSE
+}
+```
+
+| RS Response | Meaning | What Attacker Learns |
+|---|---|---|
+| `ID_NOT_EXIST` | Never registered | This ID is invalid — skip it |
+| `OFFLINE` | Registered but not connected | **This ID is REAL** — device exists, try later |
+| Success (socket_addr) | Registered and online | **This ID is LIVE** — can attempt connection now |
+
+**This is a binary oracle.** The attacker sends random 9-digit IDs and instantly knows which ones are real registered devices.
+
+### Scanning Speed Calculation
+
+An attacker writes a custom client that sends `PunchHoleRequest` messages directly to the public RS:
+
+```
+Assumptions:
+- Public RS accepts connections from any client (it must, for the protocol to work)
+- RS probably has some rate limiting, but even at 100 requests/second/connection:
+- With 10 parallel connections: ~1,000 IDs/second
+- Estimated registered devices: ~1-10 million out of 1 billion possible IDs
+
+Finding registered devices:
+- Hit rate: 0.1% to 1%
+- Average probes to find one registered device: 100-1,000
+- Time: 0.1 to 10 seconds per discovered device
+- At 1,000 IDs/second: discover ~1-10 registered devices per second
+
+Finding ONLINE devices:
+- Of registered devices, maybe 10-50% are online at any time
+- Every ~2-10 registered devices found → 1 online device
+- Net rate: ~0.1-5 online devices discovered per second
+```
+
+**Result: An attacker can build a list of thousands of online RustDesk devices per hour just by probing the public RS.**
+
+## Attack Chain: Random ID Scan → Password Attack → Access
+
+### Phase 1: Mass ID Enumeration (hours)
+
+```
+Attacker's custom client → Public RS:
+├─ Send PunchHoleRequest(id="100000000") → ID_NOT_EXIST
+├─ Send PunchHoleRequest(id="100000001") → ID_NOT_EXIST
+├─ ...
+├─ Send PunchHoleRequest(id="238471956") → OFFLINE ← REGISTERED!
+├─ ...
+├─ Send PunchHoleRequest(id="519283746") → SUCCESS ← ONLINE NOW!
+└─ Store all discovered IDs with status
+
+Output: List of thousands of valid device IDs + their online status
+```
+
+### Phase 2: Target Selection
+
+From the discovered IDs, attacker can:
+1. Probe each online ID → receive `LoginResponse` with PeerInfo containing:
+   - `username` — logged-in user (`connection.rs:1404`)
+   - `hostname` — machine name (`connection.rs:1414`)
+   - `platform` — OS type (`connection.rs:1415`)
+
+Wait — does PeerInfo leak BEFORE password auth? Let me verify:
+
+```
+The flow is:
+1. PunchHoleRequest → RS → PunchHoleResponse (get peer address)
+2. TCP connect to peer (via hole-punch or relay)
+3. Key exchange (secure=true, encrypted)
+4. Receive Hash{salt, challenge}              ← BEFORE auth
+5. Send LoginRequest{password}
+6. IF password correct → receive LoginResponse with PeerInfo
+7. IF password wrong → receive error
+```
+
+**PeerInfo (hostname, username, platform) is ONLY sent after successful password verification.** So the attacker cannot harvest hostnames without cracking the password first.
+
+However, **the salt IS leaked** to any connecting client (step 4). The salt is stable across connections (`Config::get_salt()` at `connection.rs:364`). This enables:
+- Precomputation of password hashes for common passwords
+- Same salt used for all connections from all attackers → rainbow table viable
+
+### Phase 3: Password Brute-Force Against Discovered Online Devices
+
+Through the RS-mediated encrypted connection:
+
+```
+Per-device rate limits (connection.rs:3436-3459):
+├─ 6 attempts per minute per IP
+├─ 30 total attempts per IP (lifetime until success/restart)
+├─ In-memory only → resets on service restart
+└─ IPv6: 60/64-prefix, 80/56-prefix, 100/48-prefix
+
+Distributed attack:
+├─ 1,000 IPs × 6 attempts/min = 6,000 attempts/minute per target
+├─ Before hitting lifetime limit: 30,000 attempts (30 per IP × 1,000 IPs)
+├─ Then rotate to fresh IPs
+```
+
+**Against different password types:**
+
+| Password Type | Keyspace | Time @ 6,000/min | Feasible? |
+|---|---|---|---|
+| Default temporary (6 alphanumeric) | ~2.2 billion (36^6) | ~250 days | **NO** |
+| Default temporary (8 chars) | ~2.8 trillion | ~880 years | **NO** |
+| Weak permanent ("123456") | Top 10,000 | **< 2 minutes** | **YES** |
+| Common password (dictionary) | ~1 million | **~3 hours** | **YES** |
+| Moderate password (8 char common) | ~10 million | **~28 hours** | **YES** |
+| Strong password (12+ random) | >10^18 | Never | **NO** |
+
+### Phase 4: Access After Password Crack
+
+After successful authentication (through encrypted RS-mediated connection):
+- Connection IS encrypted (secure=true)
+- Full access: screen, keyboard, files, clipboard
+- Terminal access (root shell if service runs as root) — `terminal_service.rs:879`
+- Port forwarding to internal network — `connection.rs:1132-1146`
+
+## What Actually Blocks This Chain
+
+| Barrier | Strength | Bypass |
+|---|---|---|
+| ID is 9 digits (1B keyspace) | WEAK | Enumeration oracle makes scanning trivial |
+| RS may rate-limit PunchHoleRequests | UNKNOWN | RS code not in this repo; likely some rate limiting exists |
+| Connection is encrypted (secure=true) | STRONG | Cannot eavesdrop password; must online brute-force |
+| Password rate limit (6/min/IP) | MODERATE | Distributed IPs bypass; in-memory resets on restart |
+| Default temporary password | STRONG | Keyspace too large for rate-limited brute-force |
+| User-set permanent password | **VARIABLE** | Weak passwords crackable; strong passwords survive |
+
+## Honest Assessment
+
+**Can an attacker scan random IDs and gain access? YES — but only against weak passwords.**
+
+The complete chain:
+
+```
+Step 1: Scan IDs via public RS            → WORKS (enumeration oracle, ~seconds per device found)
+Step 2: Connect to online device via RS   → WORKS (normal protocol, encrypted)
+Step 3: Receive Hash{salt, challenge}     → WORKS (pre-auth, salt is stable)
+Step 4: Brute-force password              → DEPENDS ON PASSWORD STRENGTH
+Step 5: Full access (screen/shell/files)  → WORKS after auth
+```
+
+**The default temporary password (random alphanumeric, 6-8 chars) makes brute-force infeasible** at 6,000 attempts/minute. This is the primary defense.
+
+**But many real users:**
+- Set weak permanent passwords ("123456", "password", company name, etc.)
+- Disable the temporary password and rely only on permanent password
+- Use short numeric passwords for convenience
+
+Against these users, the random-scan attack chain is **fully viable from the internet with zero prior access**.
+
+## FINDING 20 (MEDIUM): Stable Salt Enables Password Hash Precomputation
+
+**File:** `src/server/connection.rs:364`
+**Type:** CWE-916 (Use of Password Hash with Insufficient Computational Effort)
+
+The salt used in the password challenge-response is **stable** (loaded from config, same for all connections):
+
+```rust
+let hash = Hash {
+    salt: Config::get_salt(),               // Same for every connection
+    challenge: Config::get_auto_password(6), // Random per connection
+    ..Default::default()
+};
+```
+
+The password verification is: `SHA256(SHA256(password + salt) + challenge)`
+
+Since `salt` is stable and sent to the client before auth, an attacker can:
+1. Connect once → receive `salt`
+2. Precompute `SHA256(password + salt)` for millions of common passwords (offline, no rate limit)
+3. For each new connection, only compute the final `SHA256(precomputed + challenge)` — which is trivial
+4. This effectively reduces the per-connection work to one SHA256 per password guess
+
+Combined with the ID enumeration oracle, this enables **mass-scale automated password attacks** against all discovered online devices.
+
+---
+
+## Updated Threat Summary
+
+```
+ATTACK SCENARIO                         WORKS?     CONDITIONS
+──────────────────────────────────────────────────────────────────────
+
+Random ID scan → find devices           YES        Just need RS access (public)
+ID enumeration → build target list      YES        RS distinguishes ID_NOT_EXIST vs OFFLINE
+Connect to online device → encrypted    YES        Normal RS flow, encrypted
+Brute-force default temp password       NO         Keyspace too large (36^6+)
+Brute-force weak permanent password     YES        Common passwords crack in minutes-hours
+Mass scan → auto-crack weak passwords   YES        Combine ID scan + precomputed salt hashes
+  across thousands of devices
+Access after password crack             YES        Root shell, files, screen, network pivot
+
+BOTTOM LINE:
+- Against users with STRONG passwords: attack FAILS at password step
+- Against users with WEAK passwords: attack SUCCEEDS end-to-end
+- The ID enumeration oracle makes targeting trivial
+- The stable salt enables precomputation
+- NO local access, NO network adjacency, NO special config needed
+- Works against DEFAULT configuration through the PUBLIC rendezvous server
+```
